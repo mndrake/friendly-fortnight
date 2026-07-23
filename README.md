@@ -29,15 +29,21 @@ can be migrated off DB2 and the CL/RPG jobs retired.
 
 ## Quick start (no IBM i needed)
 
+Environments are managed with [uv](https://docs.astral.sh/uv/); the committed
+`uv.lock` pins the full dependency set and `.python-version` pins Python 3.11.
+
 ```sh
-pip install -e .[dev]
-pytest                                        # full suite, no host required
+uv sync                                       # creates .venv, installs project + dev deps
+uv run pytest                                 # full suite, no host required
 
 # Run the whole pipeline against the synthetic fixture estate:
-python scripts/make_fixture_host.py data/fixture-host
-python cli.py run --config config.fixture.yaml --fixture-dir data/fixture-host
+uv run python scripts/make_fixture_host.py data/fixture-host
+uv run lineage run --config config.fixture.yaml --fixture-dir data/fixture-host
 open data/report/summary.html
 ```
+
+For live-host extraction include the `host` extra (jaydebeapi/JPype):
+`uv sync --extra host`. Without uv, `pip install -e . --group dev` still works.
 
 ## Against a live system
 
@@ -49,16 +55,16 @@ open data/report/summary.html
    outfiles land there. Access is otherwise read-only; host commands run via
    `QSYS2.QCMDEXC` over the same JDBC connection.
 3. Validate connectivity and outfile layouts first:
-   `python scripts/smoke_host.py config.yaml` (checks JDBC, QCMDEXC, the
-   DSPPGMREF outfile column layout, and a source-member CCSID round-trip).
+   `uv run python scripts/smoke_host.py config.yaml` (checks JDBC, QCMDEXC,
+   the DSPPGMREF outfile column layout, and a source-member CCSID round-trip).
 4. Run the stages (each is re-runnable):
 
 ```sh
-lineage extract          # catalogs, DSPPGMREF/DSPDBR/DSPFFD, source members
-lineage parse            # DDS -> CL -> RPG -> embedded SQL -> classification
-lineage build --phase 3  # graph assembly (1 = xref only, 2 = +CL/DDS)
-lineage analyze          # per-output lineage, commonality, complexity
-lineage report           # CSV/Parquet/JSON exports + summary.html
+uv run lineage extract          # catalogs, DSPPGMREF/DSPDBR/DSPFFD, source members
+uv run lineage parse            # DDS -> CL -> RPG -> embedded SQL -> classification
+uv run lineage build --phase 3  # graph assembly (1 = xref only, 2 = +CL/DDS)
+uv run lineage analyze          # per-output lineage, commonality, complexity
+uv run lineage report           # CSV/Parquet/JSON exports + summary.html
 ```
 
 Set the password via `LINEAGE_DB_PASSWORD` rather than storing it in

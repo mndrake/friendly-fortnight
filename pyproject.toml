@@ -23,6 +23,9 @@ dependencies = [
 host = [
     "jaydebeapi>=1.2",
 ]
+
+# Installed by default with `uv sync`; use `--no-dev` to skip.
+[dependency-groups]
 dev = [
     "pytest>=8",
 ]
