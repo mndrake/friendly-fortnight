@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "db2-lineage"
+version = "0.1.0"
+description = "DB2 for i lineage analyzer: trace output files/tables back to base physical files and columns through CL, RPG, DDS, and SQL."
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+dependencies = [
+    "duckdb>=1.0",
+    "sqlglot>=25",
+    "networkx>=3.2",
+    "pyarrow>=15",
+    "typer>=0.12",
+    "PyYAML>=6",
+]
+
+[project.optional-dependencies]
+# Live-host extraction only. Not needed for parsing/analysis/tests.
+host = [
+    "jaydebeapi>=1.2",
+]
+dev = [
+    "pytest>=8",
+]
+
+[project.scripts]
+lineage = "lineage.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.setuptools.package-data]
+lineage = ["schema/*.sql"]

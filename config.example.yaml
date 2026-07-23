@@ -1,0 +1,65 @@
+# DB2 for i Lineage Analyzer — example configuration.
+# Copy to config.yaml and fill in real values. config.yaml is gitignored.
+
+connection:
+  # IBM Toolbox for Java (jt400.jar) JDBC.
+  host: MYLPAR.EXAMPLE.COM
+  # Driver jar path; download jt400 and place it here (drivers/ is gitignored).
+  jar: drivers/jt400.jar
+  driver_class: com.ibm.as400.access.AS400JDBCDriver
+  # jdbc url is templated from host if url is omitted.
+  url: null
+  user: MYUSER
+  # Prefer LINEAGE_DB_PASSWORD env var over storing the password here.
+  password: null
+  # Extra JDBC properties passed through to the driver.
+  properties:
+    naming: sql
+    errors: full
+    prompt: "false"
+    # translate binary/CCSID handling is driver-default; source retrieval relies on it.
+
+# Scratch library on the host for command outfiles and temporary aliases.
+# Must be pre-created and writable by the connection user.
+scratch_lib: QTEMP
+
+# Libraries to scan for objects and source. Order is significant only for reporting.
+libraries:
+  - APPLIB
+  - APPLIBSRC
+
+# Source physical files (library/file) to enumerate and retrieve members from.
+source_files:
+  - library: APPLIBSRC
+    file: QCLSRC
+  - library: APPLIBSRC
+    file: QRPGLESRC
+  - library: APPLIBSRC
+    file: QDDSSRC
+
+# The output files/tables that users consume — the seeds for backward lineage.
+# id is a stable label used across reports.
+output_seeds:
+  - id: CUST_MONTHLY_RPT
+    library: APPLIB
+    file: CUSTMTHRPT
+  - id: ORDER_EXTRACT
+    library: APPLIB
+    file: ORDEXT
+
+# Assumed library lists per job / subsystem, used to resolve unqualified
+# object references found in source. First match wins; multiple matches are
+# flagged as ambiguous.
+liblists:
+  default:
+    - APPLIB
+    - QGPL
+  BATCHSUB:
+    - APPLIB
+    - APPLIBWK
+    - QGPL
+
+# Local storage locations (relative to repo root).
+storage:
+  duckdb: data/lineage.duckdb
+  parquet_dir: data/parquet

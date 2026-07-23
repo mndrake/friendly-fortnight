@@ -1,0 +1,39 @@
+# Demo configuration for running the pipeline against the synthetic fixture
+# estate (no IBM i needed):
+#
+#   python scripts/make_fixture_host.py data/fixture-host
+#   python cli.py run --config config.fixture.yaml --fixture-dir data/fixture-host
+#
+connection: {}          # never used with --fixture-dir
+
+scratch_lib: QTEMP
+
+libraries:
+  - APPLIB
+
+source_files:
+  - library: APPLIB
+    file: QCLSRC
+  - library: APPLIB
+    file: QRPGSRC
+  - library: APPLIB
+    file: QDDSSRC
+
+output_seeds:
+  - id: CUST_MONTHLY_RPT
+    library: APPLIB
+    file: CUSTRPT
+  - id: ORDER_EXTRACT
+    library: APPLIB
+    file: ORDEXT
+  - id: ORDER_SUMMARY
+    library: APPLIB
+    file: ORDSUM
+
+liblists:
+  default:
+    - APPLIB
+
+storage:
+  duckdb: data/fixture-demo.duckdb
+  parquet_dir: data/fixture-demo-parquet

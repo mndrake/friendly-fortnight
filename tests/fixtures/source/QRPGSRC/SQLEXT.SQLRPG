@@ -1,0 +1,7 @@
+     F*  SQLEXT - ORDER EXTRACT VIA EMBEDDED SQL (SQLRPG, RPG III)
+     C/EXEC SQL
+     C+ INSERT INTO ORDEXT (ORDNO, AMT)
+     C+   SELECT ORDNO, AMOUNT FROM ORDERS
+     C+   WHERE AMOUNT > 0
+     C/END-EXEC
+     C                     SETON                     LR

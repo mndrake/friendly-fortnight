@@ -1,0 +1,9 @@
+     H*  RPT001 - CUSTOMER MONTHLY REPORT (RPG III)
+     FCUSTLF1 IF  E                  DISK
+     FORDERS  IF  E                  DISK
+     FCUSTRPT O   E                  DISK
+     C* MAIN LOOP - READ ORDERS, LOOK UP CUSTOMER, WRITE REPORT LINE
+     C                     READ ORDERS                   90
+     C           CUSTNO    CHAINCUSTLF1                  91
+     C                     WRITECUSTRREC
+     C                     SETON                     LR

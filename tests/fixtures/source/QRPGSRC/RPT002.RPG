@@ -1,0 +1,6 @@
+     H*  RPT002 - ORDER SUMMARY (RPG III)
+     FORDERS  IF  E                  DISK
+     FORDSUM  O   E                  DISK
+     C                     READ ORDERS                   90
+     C                     WRITEORDSREC
+     C                     SETON                     LR

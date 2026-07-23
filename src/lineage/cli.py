@@ -1,0 +1,171 @@
+"""Typer CLI: extract / parse / build / analyze / report.
+
+Each command is runnable end-to-end at whatever fidelity exists so far; later
+stages tolerate missing earlier layers (they just produce less).
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Optional
+
+import typer
+
+from . import db as dbmod
+from .config import Config, load_config
+
+app = typer.Typer(help="DB2 for i lineage analyzer", no_args_is_help=True)
+
+_CONFIG_OPT = typer.Option("config.yaml", "--config", "-c",
+                           help="Path to config.yaml")
+
+
+def _load(config_path: str) -> Config:
+    return load_config(config_path)
+
+
+def _con(cfg: Config):
+    return dbmod.connect(cfg.duckdb_path)
+
+
+def _echo_counts(counts: dict) -> None:
+    for k, v in counts.items():
+        typer.echo(f"  {k}: {v}")
+
+
+@app.command()
+def extract(config: str = _CONFIG_OPT,
+            fixture_dir: Optional[str] = typer.Option(
+                None, help="Serve host responses from a fixture directory "
+                           "instead of connecting to the LPAR")) -> None:
+    """Pull catalogs, cross-references, and source members into the raw store."""
+    cfg = _load(config)
+    con = _con(cfg)
+    if fixture_dir:
+        from .extract.connection import FixtureHostSession
+        session = FixtureHostSession(fixture_dir=fixture_dir)
+    else:
+        from .extract.connection import open_session
+        session = open_session(cfg.connection)
+    try:
+        from .extract import catalog, source, xref
+        dbmod.reset_layer(con, "raw")
+        typer.echo("catalog:")
+        _echo_counts(catalog.harvest(session, con, cfg))
+        typer.echo("xref:")
+        _echo_counts(xref.harvest(session, con, cfg))
+        typer.echo("source:")
+        _echo_counts(source.harvest(session, con, cfg))
+        if not source.verify_roundtrip(con):
+            typer.secho(
+                "WARNING: no non-blank source lines retrieved — possible "
+                "CCSID/translation problem", fg=typer.colors.YELLOW)
+    finally:
+        session.close()
+        con.close()
+
+
+@app.command()
+def parse(config: str = _CONFIG_OPT) -> None:
+    """Parse retrieved source members (DDS, CL, RPG, embedded SQL)."""
+    cfg = _load(config)
+    con = _con(cfg)
+    try:
+        from .parse import cl, classify, dds, embedded_sql, rpg
+        dbmod.reset_layer(con, "parsed")
+        typer.echo("dds:")
+        _echo_counts(dds.parse_all(con))
+        typer.echo("cl:")
+        _echo_counts(cl.parse_all(con))
+        typer.echo("rpg:")
+        _echo_counts(rpg.parse_all(con))
+        typer.echo("sql:")
+        _echo_counts(embedded_sql.parse_all(con))
+        typer.echo("classification:")
+        _echo_counts(classify.classify_all(con))
+    finally:
+        con.close()
+
+
+@app.command()
+def build(config: str = _CONFIG_OPT,
+          phase: int = typer.Option(3, help="1=xref/catalog only, "
+                                            "2=+CL/DDS, 3=full")) -> None:
+    """Assemble the lineage graph from raw + parsed layers."""
+    cfg = _load(config)
+    con = _con(cfg)
+    try:
+        from .graph.build import build_graph
+        g = build_graph(con, cfg, phase=phase)
+        typer.echo(f"  nodes: {g.number_of_nodes()}")
+        typer.echo(f"  edges: {g.number_of_edges()}")
+        n_gaps = dbmod.table_count(con, "gaps")
+        typer.echo(f"  gaps: {n_gaps}")
+    finally:
+        con.close()
+
+
+@app.command()
+def analyze(config: str = _CONFIG_OPT) -> None:
+    """Compute per-output lineage, commonality, and complexity."""
+    cfg = _load(config)
+    con = _con(cfg)
+    try:
+        from .analyze import commonality, complexity, lineage
+        from .graph.build import load_graph
+        g = load_graph(con)
+        typer.echo("lineage:")
+        _echo_counts(lineage.compute_output_lineage(con, g, cfg))
+        typer.echo("commonality:")
+        _echo_counts(commonality.analyze(con))
+        typer.echo("complexity:")
+        _echo_counts(complexity.score(con, g, cfg))
+    finally:
+        con.close()
+
+
+@app.command()
+def report(config: str = _CONFIG_OPT,
+           out: str = typer.Option("data/report", help="Output directory"),
+           fmt: str = typer.Option("csv", help="Table export format: csv|parquet")) -> None:
+    """Export tables and render the HTML summary report."""
+    cfg = _load(config)
+    con = _con(cfg)
+    try:
+        from .analyze.gaps import coverage
+        from .graph.build import load_graph
+        from .report import export, html as html_report
+        cov = coverage(con, cfg)
+        out_dir = Path(out)
+        written = export.export_tables(con, out_dir, fmt=fmt)
+        g = load_graph(con)
+        written += export.export_output_graphs(con, g, cfg, out_dir / "graphs")
+        (out_dir / "coverage.json").write_text(
+            json.dumps(cov, indent=2, sort_keys=True), encoding="utf-8")
+        html_path = html_report.render(con, cov, out_dir / "summary.html")
+        typer.echo(f"  tables: {len(written)} files")
+        typer.echo(f"  coverage: {out_dir / 'coverage.json'}")
+        typer.echo(f"  html: {html_path}")
+        s = cov["summary"]
+        typer.echo(
+            f"  outputs resolved {s['outputs_resolved']}/{s['outputs_total']} "
+            f"({s['pct_resolved']}%), partial {s['outputs_partial']}, "
+            f"unresolved {s['outputs_unresolved']}")
+    finally:
+        con.close()
+
+
+@app.command()
+def run(config: str = _CONFIG_OPT,
+        fixture_dir: Optional[str] = typer.Option(None),
+        phase: int = typer.Option(3)) -> None:
+    """extract → parse → build → analyze → report, end to end."""
+    extract(config=config, fixture_dir=fixture_dir)
+    parse(config=config)
+    build(config=config, phase=phase)
+    analyze(config=config)
+    report(config=config, out="data/report", fmt="csv")
+
+
+if __name__ == "__main__":
+    app()

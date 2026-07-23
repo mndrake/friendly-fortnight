@@ -1,0 +1,4 @@
+     A*  ORDER EXTRACT OUTPUT FILE
+     A          R ORDXREC
+     A            ORDNO          7P 0
+     A            AMT            9P 2

@@ -1,0 +1,8 @@
+     A**********************************************************************
+     A*  CUSTOMER MASTER PHYSICAL FILE
+     A**********************************************************************
+     A          R CUSTREC
+     A            CUSTNO         6P 0
+     A            CUSTNAME      30A
+     A            REGION         3A
+     A          K CUSTNO

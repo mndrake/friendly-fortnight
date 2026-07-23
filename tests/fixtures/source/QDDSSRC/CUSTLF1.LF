@@ -1,0 +1,5 @@
+     A*  LOGICAL OVER CUSTOMER MASTER WITH RENAME
+     A          R CUSTREC                   PFILE(CUSTMAST)
+     A            CUSTNO
+     A            CNAME                     RENAME(CUSTNAME)
+     A          K CUSTNO

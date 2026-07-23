@@ -1,0 +1,19 @@
+     H*  PGMDESC - LEGACY PROGRAM-DESCRIBED FILE PROCESSOR (RPG III)
+     FLEGACY  IF  F     132          DISK
+     FLEGOUT  O   F     132          DISK
+     I*  PROGRAM-DESCRIBED INPUT LAYOUT
+     ILEGACY  AA  01
+     I                                        1  60FLD1
+     I                                        7  36 FLD2
+     C                     READ LEGACY                   90
+     C                     MOVE FLD1      WFLD1
+     C                     MOVE FLD2      WFLD2
+     C                     MOVELWFLD1     OFLD1
+     C                     MOVELWFLD2     OFLD2
+     C                     MOVE WFLD1     XFLD1
+     C                     MOVE WFLD2     XFLD2
+     C                     EXCPTOUT1
+     C                     SETON                     LR
+     OLEGOUT  E                OUT1
+     O                         OFLD1     6
+     O                         OFLD2    36

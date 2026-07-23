@@ -1,0 +1,27 @@
+# Local data store (DuckDB + Parquet) — never committed
+/data/*
+!/data/.gitkeep
+
+# JDBC driver jar — supplied by operator, not committed
+/drivers/*.jar
+
+# Local config with real connection details
+/config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

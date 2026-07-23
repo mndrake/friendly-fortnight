@@ -1,0 +1,5 @@
+     A*  CUSTOMER MONTHLY REPORT OUTPUT FILE
+     A          R CUSTRREC
+     A            CUSTNO         6P 0
+     A            CNAME         30A
+     A            AMOUNT         9P 2
