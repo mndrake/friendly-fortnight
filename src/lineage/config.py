@@ -63,6 +63,14 @@ class StorageConfig:
     parquet_dir: str = "data/parquet"
 
 
+# How source member text is retrieved from the host:
+# - "ifs_read": QSYS2.IFS_READ over the member's /QSYS.LIB path. Stateless,
+#   no scratch objects; requires IBM i 7.3 TR7 / 7.4 or later.
+# - "alias": CREATE ALIAS in scratch_lib -> SELECT -> DROP ALIAS. Works on
+#   older releases; creates a temporary object per member read.
+SOURCE_RETRIEVAL_MODES = ("ifs_read", "alias")
+
+
 @dataclass(frozen=True)
 class Config:
     connection: ConnectionConfig
@@ -72,6 +80,7 @@ class Config:
     output_seeds: tuple[OutputSeed, ...]
     liblists: dict[str, tuple[str, ...]]
     storage: StorageConfig
+    source_retrieval: str = "ifs_read"
     root: Path = Path(".")
 
     def liblist(self, name: str | None) -> tuple[str, ...]:
@@ -166,6 +175,12 @@ def from_dict(raw: dict[str, Any], root: Path = Path(".")) -> Config:
         parquet_dir=storage_raw.get("parquet_dir", "data/parquet"),
     )
 
+    source_retrieval = str(raw.get("source_retrieval", "ifs_read")).lower()
+    if source_retrieval not in SOURCE_RETRIEVAL_MODES:
+        raise ConfigError(
+            f"source_retrieval must be one of {SOURCE_RETRIEVAL_MODES}, "
+            f"got '{source_retrieval}'")
+
     return Config(
         connection=connection,
         scratch_lib=str(scratch_lib),
@@ -174,5 +189,6 @@ def from_dict(raw: dict[str, Any], root: Path = Path(".")) -> Config:
         output_seeds=output_seeds,
         liblists=liblists,
         storage=storage,
+        source_retrieval=source_retrieval,
         root=root,
     )

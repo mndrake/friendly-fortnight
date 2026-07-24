@@ -51,9 +51,13 @@ For live-host extraction include the `host` extra (jaydebeapi/JPype):
    `config.yaml` (gitignored); fill in connection, scanned libraries, source
    files, output seeds, and assumed library lists. These are **configuration,
    not discovery**.
-2. Ensure the configured `scratch_lib` exists and is writable — command
-   outfiles land there. Access is otherwise read-only; host commands run via
-   `QSYS2.QCMDEXC` over the same JDBC connection.
+2. Ensure the configured `scratch_lib` exists and is writable — the
+   DSPPGMREF/DSPDBR/DSPFFD command outfiles land there. Access is otherwise
+   read-only; host commands run via `QSYS2.QCMDEXC` over the same JDBC
+   connection. Source member text is read with `QSYS2.IFS_READ` by default
+   (no temporary objects at all; needs IBM i 7.3 TR7 / 7.4+) — set
+   `source_retrieval: alias` on older releases to use the
+   CREATE ALIAS-in-scratch-lib fallback instead.
 3. Validate connectivity and outfile layouts first:
    `uv run python scripts/smoke_host.py config.yaml` (checks JDBC, QCMDEXC,
    the DSPPGMREF outfile column layout, and a source-member CCSID round-trip).

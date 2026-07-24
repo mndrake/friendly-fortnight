@@ -133,6 +133,7 @@ class FixtureHostSession:
         self._responses = responses or {}
         self._dir = Path(fixture_dir) if fixture_dir else None
         self.cl_log: list[str] = []
+        self.sql_log: list[str] = []
         self._last_tag: str | None = None
 
     def with_tag(self, tag: str) -> "FixtureHostSession":
@@ -144,6 +145,7 @@ class FixtureHostSession:
         return self
 
     def query(self, sql: str, params: Sequence[Any] = ()) -> QueryResult:
+        self.sql_log.append(sql)
         tag = self._last_tag
         self._last_tag = None
         if tag is None:

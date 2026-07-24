@@ -19,9 +19,18 @@ connection:
     prompt: "false"
     # translate binary/CCSID handling is driver-default; source retrieval relies on it.
 
-# Scratch library on the host for command outfiles and temporary aliases.
-# Must be pre-created and writable by the connection user.
+# Scratch library on the host for command outfiles (DSPPGMREF/DSPDBR/DSPFFD
+# must write *somewhere*). Must be pre-created and writable by the connection
+# user. QTEMP is per-job, so it is safe to share this value across sessions.
 scratch_lib: QTEMP
+
+# How source member text is read:
+#   ifs_read (default) - QSYS2.IFS_READ over the member's /QSYS.LIB path.
+#                        Stateless, creates no objects at all; requires
+#                        IBM i 7.3 TR7 / 7.4 or later.
+#   alias              - CREATE ALIAS in scratch_lib -> SELECT -> DROP ALIAS.
+#                        Use on older releases.
+source_retrieval: ifs_read
 
 # Libraries to scan for objects and source. Order is significant only for reporting.
 libraries:

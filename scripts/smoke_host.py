@@ -51,8 +51,10 @@ def main() -> int:
         else:
             print(f"[3] DSPPGMREF layout ok ({len(r.rows)} sample rows)")
 
-        # 4. Source member round-trip.
+        # 4. Source member round-trip via the configured retrieval strategy
+        #    (ifs_read needs QSYS2.IFS_READ: IBM i 7.3 TR7 / 7.4+).
         if cfg.source_files:
+            from lineage.extract.source import retrieve_member
             src = cfg.source_files[0]
             r = session.query(
                 "SELECT PARTITION_NAME FROM QSYS2.SYSPARTITIONSTAT "
@@ -60,24 +62,18 @@ def main() -> int:
                 f"TABLE_NAME = '{src.file}' FETCH FIRST 1 ROWS ONLY")
             if r.rows:
                 member = r.rows[0][0].strip()
-                alias = f"{cfg.scratch_lib}.SMOKEMBR"
-                session.query(
-                    f"CREATE ALIAS {alias} FOR {src.library}.{src.file}"
-                    f"({member})")
-                try:
-                    lines = session.query(
-                        f"SELECT SRCSEQ, SRCDTA FROM {alias} "
-                        "FETCH FIRST 5 ROWS ONLY")
-                    text = " ".join(str(row[1]) for row in lines.rows)
-                    printable = sum(1 for ch in text if ch.isprintable())
-                    if text and printable / max(len(text), 1) > 0.9:
-                        print(f"[4] source round-trip ok ({src.qualified}/"
-                              f"{member})")
-                    else:
-                        print("[4] source text looks garbled — check CCSID")
-                        ok = False
-                finally:
-                    session.query(f"DROP ALIAS {alias}")
+                lines = retrieve_member(session, src, member, cfg)
+                text = " ".join(t for _, t in lines[:5])
+                printable = sum(1 for ch in text if ch.isprintable())
+                if text and printable / max(len(text), 1) > 0.9:
+                    print(f"[4] source round-trip ok ({src.qualified}/"
+                          f"{member}, strategy={cfg.source_retrieval})")
+                else:
+                    print(f"[4] source text empty or garbled via "
+                          f"{cfg.source_retrieval} — check CCSID, or IBM i "
+                          "release support for QSYS2.IFS_READ (fall back "
+                          "with source_retrieval: alias)")
+                    ok = False
             else:
                 print(f"[4] no members in {src.qualified}, skipped")
     finally:

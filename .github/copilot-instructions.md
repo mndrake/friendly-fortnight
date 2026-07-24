@@ -39,6 +39,10 @@ Rules that must hold:
   `HostSession` protocol (`extract/connection.py`). Parsers, graph, analysis,
   and reports read DuckDB only. Host access is read-only; host commands go
   through `QSYS2.QCMDEXC`; outfiles land in the configured scratch library.
+  Source member text is read via `QSYS2.IFS_READ` by default
+  (`source_retrieval: ifs_read`, stateless, no scratch objects); the
+  `alias` strategy (CREATE/DROP ALIAS in scratch_lib) exists only for
+  pre-7.3-TR7 releases. Both fetch under the same fixture tag.
 - Libraries, output seeds, and library lists are **configuration, not
   discovery** (`config.yaml`, loaded by `lineage/config.py`). Never infer
   them from the host.
