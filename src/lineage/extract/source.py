@@ -55,12 +55,27 @@ def ifs_member_path(src: SourceFileRef, member: str) -> str:
 
 
 def retrieve_member(session: HostSession, src: SourceFileRef, member: str,
-                    config: Config) -> list[tuple[int, str]]:
-    """Retrieve one member's lines as ``(seq, text)`` using the configured
-    strategy."""
+                    config: Config) -> tuple[list[tuple[int, str]], str]:
+    """Retrieve one member's lines as ``(seq, text)``.
+
+    Returns ``(lines, strategy_used)``. In ``ifs_read`` mode an empty result
+    triggers a per-member fallback to the alias strategy: IFS_READ reports a
+    failed open as *zero rows plus a job-log warning*, not an SQL error —
+    which happens for members of DDS/externally described data PFs (text-mode
+    QSYS.LIB access only supports source PFs and single-field
+    program-described PFs) and for SRCDTA CCSID 65535 (no conversion). The
+    alias path is plain record-level SQL and works for all of these.
+    """
     if config.source_retrieval == "alias":
-        return retrieve_member_alias(session, src, member, config.scratch_lib)
-    return retrieve_member_ifs(session, src, member)
+        return retrieve_member_alias(session, src, member,
+                                     config.scratch_lib), "alias"
+    lines = retrieve_member_ifs(session, src, member)
+    if lines:
+        return lines, "ifs_read"
+    fallback = retrieve_member_alias(session, src, member, config.scratch_lib)
+    if fallback:
+        return fallback, "alias_fallback"
+    return lines, "ifs_read"
 
 
 def retrieve_member_ifs(session: HostSession, src: SourceFileRef,
@@ -118,22 +133,28 @@ def _drop_alias(session: HostSession, alias: str) -> None:
 
 def harvest(session: HostSession, con, config: Config) -> dict[str, int]:
     """Enumerate and retrieve every member of every configured source file."""
-    total = 0
     rows: list[tuple[Any, ...]] = []
+    fallbacks = 0
     for src in config.source_files:
         for m in enumerate_members(session, src):
             member = m["member"]
             member_type = m.get("member_type")
-            lines = retrieve_member(session, src, member, config)
+            lines, strategy = retrieve_member(session, src, member, config)
+            if strategy == "alias_fallback":
+                fallbacks += 1
             for seq, text in lines:
                 rows.append((src.library, src.file, member, member_type, seq, text))
-                total += 1
     inserted = insert_rows(
         con, "raw_source_members",
         ["library", "srcfile", "member", "member_type", "seq", "line_text"],
         rows,
     )
-    return {"raw_source_members": inserted}
+    counts = {"raw_source_members": inserted}
+    if fallbacks:
+        # Members IFS_READ could not open in text mode (data-PF source files
+        # or CCSID 65535); the alias strategy served them instead.
+        counts["ifs_read_fallbacks"] = fallbacks
+    return counts
 
 
 def verify_roundtrip(con) -> bool:

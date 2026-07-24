@@ -40,9 +40,12 @@ Rules that must hold:
   and reports read DuckDB only. Host access is read-only; host commands go
   through `QSYS2.QCMDEXC`; outfiles land in the configured scratch library.
   Source member text is read via `QSYS2.IFS_READ` by default
-  (`source_retrieval: ifs_read`, stateless, no scratch objects); the
-  `alias` strategy (CREATE/DROP ALIAS in scratch_lib) exists only for
-  pre-7.3-TR7 releases. Both fetch under the same fixture tag.
+  (`source_retrieval: ifs_read`, stateless, no scratch objects). IFS_READ
+  signals a failed open as zero rows + a job-log warning, not an SQL error
+  (data-PF members, CCSID 65535), so an empty result auto-falls-back to the
+  `alias` strategy (CREATE/DROP ALIAS in scratch_lib) per member; `alias`
+  mode uses aliases exclusively for pre-7.3-TR7 releases. Both fetch under
+  the same fixture tag.
 - Libraries, output seeds, and library lists are **configuration, not
   discovery** (`config.yaml`, loaded by `lineage/config.py`). Never infer
   them from the host.

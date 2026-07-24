@@ -59,12 +59,64 @@ def test_alias_strategy_creates_and_drops(session):
 
 
 def test_dispatch_honours_config(session):
-    retrieve_member(session, SourceFileRef("APPLIB", "QRPGSRC"), "RPT001",
-                    _cfg("ifs_read"))
+    _, strategy = retrieve_member(session, SourceFileRef("APPLIB", "QRPGSRC"),
+                                  "RPT001", _cfg("ifs_read"))
+    assert strategy == "ifs_read"
     assert not any("ALIAS" in q for q in session.sql_log)
-    retrieve_member(session, SourceFileRef("APPLIB", "QRPGSRC"), "RPT001",
-                    _cfg("alias"))
+    _, strategy = retrieve_member(session, SourceFileRef("APPLIB", "QRPGSRC"),
+                                  "RPT001", _cfg("alias"))
+    assert strategy == "alias"
     assert any("CREATE ALIAS" in q for q in session.sql_log)
+
+
+class _IfsBlindSession:
+    """Stub host where IFS_READ silently returns nothing (its real failure
+    mode for data-PF members / CCSID 65535) but record-level SQL works."""
+
+    def __init__(self):
+        self.sql_log = []
+
+    def query(self, sql, params=()):
+        from lineage.extract.connection import QueryResult
+        self.sql_log.append(sql)
+        if "IFS_READ" in sql:
+            return QueryResult(columns=["LINE_NUMBER", "LINE"], rows=[])
+        if "SRCSEQ" in sql:
+            return QueryResult(columns=["SRCSEQ", "SRCDTA"],
+                               rows=[(1, "CREATE TABLE BROAST (X INT)")])
+        return QueryResult(columns=[], rows=[])
+
+    def run_cl(self, command):  # pragma: no cover - unused
+        pass
+
+    def close(self):  # pragma: no cover - unused
+        pass
+
+
+def test_ifs_read_empty_falls_back_to_alias():
+    session = _IfsBlindSession()
+    lines, strategy = retrieve_member(
+        session, SourceFileRef("TNTACCSRC", "QDDLSRC"), "BROAST",
+        _cfg("ifs_read"))
+    assert strategy == "alias_fallback"
+    assert lines == [(1, "CREATE TABLE BROAST (X INT)")]
+    assert any("IFS_READ" in q for q in session.sql_log)
+    assert any("CREATE ALIAS" in q for q in session.sql_log)
+
+
+def test_genuinely_empty_member_does_not_loop():
+    class _AllEmpty(_IfsBlindSession):
+        def query(self, sql, params=()):
+            from lineage.extract.connection import QueryResult
+            self.sql_log.append(sql)
+            return QueryResult(columns=["LINE_NUMBER", "LINE"], rows=[])
+
+    session = _AllEmpty()
+    lines, strategy = retrieve_member(
+        session, SourceFileRef("APPLIB", "QRPGSRC"), "EMPTYMBR",
+        _cfg("ifs_read"))
+    assert lines == []
+    assert strategy == "ifs_read"
 
 
 def test_both_strategies_return_identical_text(session):

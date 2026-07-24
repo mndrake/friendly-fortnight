@@ -26,10 +26,14 @@ scratch_lib: QTEMP
 
 # How source member text is read:
 #   ifs_read (default) - QSYS2.IFS_READ over the member's /QSYS.LIB path.
-#                        Stateless, creates no objects at all; requires
-#                        IBM i 7.3 TR7 / 7.4 or later.
-#   alias              - CREATE ALIAS in scratch_lib -> SELECT -> DROP ALIAS.
-#                        Use on older releases.
+#                        Stateless, creates no objects; requires IBM i
+#                        7.3 TR7 / 7.4 or later. IFS_READ reports a failed
+#                        open as ZERO ROWS (not an error) — e.g. members of
+#                        DDS/externally-described data PFs, or SRCDTA CCSID
+#                        65535 — so any member that comes back empty is
+#                        automatically retried via the alias strategy.
+#   alias              - CREATE ALIAS in scratch_lib -> SELECT -> DROP ALIAS
+#                        for every member. Use on older releases.
 source_retrieval: ifs_read
 
 # Libraries to scan for objects and source. Order is significant only for reporting.

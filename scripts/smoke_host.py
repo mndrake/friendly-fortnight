@@ -62,17 +62,21 @@ def main() -> int:
                 f"TABLE_NAME = '{src.file}' FETCH FIRST 1 ROWS ONLY")
             if r.rows:
                 member = r.rows[0][0].strip()
-                lines = retrieve_member(session, src, member, cfg)
+                lines, strategy = retrieve_member(session, src, member, cfg)
                 text = " ".join(t for _, t in lines[:5])
                 printable = sum(1 for ch in text if ch.isprintable())
                 if text and printable / max(len(text), 1) > 0.9:
                     print(f"[4] source round-trip ok ({src.qualified}/"
-                          f"{member}, strategy={cfg.source_retrieval})")
+                          f"{member}, strategy={strategy})")
+                    if strategy == "alias_fallback":
+                        print("    note: IFS_READ returned no rows for this "
+                              "member (data-PF source file or SRCDTA CCSID "
+                              "65535?) — alias fallback was used")
                 else:
-                    print(f"[4] source text empty or garbled via "
-                          f"{cfg.source_retrieval} — check CCSID, or IBM i "
-                          "release support for QSYS2.IFS_READ (fall back "
-                          "with source_retrieval: alias)")
+                    print(f"[4] source text empty or garbled "
+                          f"(strategy={strategy}) — check member contents, "
+                          "CCSID, and QSYS2.JOBLOG_INFO('*') for the "
+                          "underlying IFS_READ message")
                     ok = False
             else:
                 print(f"[4] no members in {src.qualified}, skipped")

@@ -55,9 +55,11 @@ For live-host extraction include the `host` extra (jaydebeapi/JPype):
    DSPPGMREF/DSPDBR/DSPFFD command outfiles land there. Access is otherwise
    read-only; host commands run via `QSYS2.QCMDEXC` over the same JDBC
    connection. Source member text is read with `QSYS2.IFS_READ` by default
-   (no temporary objects at all; needs IBM i 7.3 TR7 / 7.4+) — set
-   `source_retrieval: alias` on older releases to use the
-   CREATE ALIAS-in-scratch-lib fallback instead.
+   (no temporary objects at all; needs IBM i 7.3 TR7 / 7.4+). IFS_READ
+   reports a failed open as zero rows rather than an error — members of
+   DDS/externally-described data PFs and CCSID-65535 source columns do this —
+   so empty members automatically retry through the CREATE ALIAS path;
+   set `source_retrieval: alias` to use aliases exclusively (older releases).
 3. Validate connectivity and outfile layouts first:
    `uv run python scripts/smoke_host.py config.yaml` (checks JDBC, QCMDEXC,
    the DSPPGMREF outfile column layout, and a source-member CCSID round-trip).
