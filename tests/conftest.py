@@ -98,8 +98,35 @@ _PGMREF = [
 ]
 
 
+# Catalog shapes served by the fixture host: the columns each QSYS2 view
+# "has" on this imaginary IBM i 7.4 box. Drives the capability probe.
+_CATALOG_SHAPES: dict[str, list[str]] = {
+    "SYSTABLES": ["TABLE_SCHEMA", "TABLE_NAME", "SYSTEM_TABLE_NAME",
+                  "TABLE_TYPE", "FILE_TYPE", "NUMBER_ROWS", "LONG_COMMENT"],
+    "SYSCOLUMNS": ["TABLE_SCHEMA", "TABLE_NAME", "SYSTEM_TABLE_NAME",
+                   "COLUMN_NAME", "SYSTEM_COLUMN_NAME", "ORDINAL_POSITION",
+                   "DATA_TYPE", "LENGTH", "NUMERIC_SCALE", "IS_NULLABLE",
+                   "COLUMN_HEADING"],
+    "SYSVIEWS": ["TABLE_SCHEMA", "TABLE_NAME", "SYSTEM_VIEW_NAME",
+                 "VIEW_DEFINITION"],
+    "SYSVIEWDEP": ["VIEW_SCHEMA", "VIEW_NAME", "OBJECT_SCHEMA",
+                   "OBJECT_NAME", "OBJECT_TYPE"],
+    "SYSPARTITIONSTAT": ["TABLE_SCHEMA", "TABLE_NAME", "SYSTEM_TABLE_NAME",
+                         "TABLE_PARTITION", "NUMBER_ROWS", "SOURCE_TYPE"],
+    "SYSROUTINES": ["ROUTINE_SCHEMA", "ROUTINE_NAME"],
+}
+
+
 def build_session() -> FixtureHostSession:
     responses: dict[str, QueryResult] = {}
+
+    responses["probe.env"] = QueryResult(
+        columns=["OS_VERSION", "OS_RELEASE"], rows=[("7", "4")])
+    responses["probe.catalog_columns"] = QueryResult(
+        columns=["TABLE_NAME", "COLUMN_NAME"],
+        rows=[(view, col) for view, cols in _CATALOG_SHAPES.items()
+              for col in cols])
+    responses["probe.ifs_read"] = QueryResult(columns=["COUNT"], rows=[(1,)])
 
     responses["catalog.systables"] = QueryResult(
         columns=["TABLE_SCHEMA", "TABLE_NAME", "SYSTEM_TABLE_NAME",
@@ -180,10 +207,12 @@ def con():
 @pytest.fixture()
 def extracted(con, session, config):
     """DuckDB store populated with the full fixture estate (raw layer)."""
-    from lineage.extract import catalog, source, xref
-    catalog.harvest(session, con, config)
+    from lineage.extract import catalog, hostinfo, source, xref
+    profile = hostinfo.probe(session)
+    profile.save(con)
+    catalog.harvest(session, con, config, profile)
     xref.harvest(session, con, config)
-    source.harvest(session, con, config)
+    source.harvest(session, con, config, profile)
     return con
 
 

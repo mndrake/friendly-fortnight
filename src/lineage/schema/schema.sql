@@ -86,6 +86,12 @@ CREATE TABLE IF NOT EXISTS raw_dspffd (
     field_ordinal  INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS host_profile (
+    -- Capability probe results (version, catalog columns, IFS_READ presence).
+    key            VARCHAR,
+    value          VARCHAR
+);
+
 CREATE TABLE IF NOT EXISTS raw_source_members (
     library        VARCHAR,
     srcfile        VARCHAR,

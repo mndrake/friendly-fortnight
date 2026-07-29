@@ -24,12 +24,10 @@ def test_ifs_member_path():
         "/QSYS.LIB/TNTACCSRC.LIB/QDDLSRC.FILE/BROAST.MBR"
 
 
-def test_default_mode_is_ifs_read():
-    cfg = from_dict({
-        "scratch_lib": "QTEMP", "libraries": ["APPLIB"],
-        "output_seeds": [{"id": "X", "library": "APPLIB", "file": "OUT"}],
-    })
-    assert cfg.source_retrieval == "ifs_read"
+def test_auto_mode_resolves_to_ifs_read_without_profile(session):
+    _, strategy = retrieve_member(session, SourceFileRef("APPLIB", "QRPGSRC"),
+                                  "RPT001", _cfg("auto"))
+    assert strategy == "ifs_read"
 
 
 def test_invalid_mode_rejected():

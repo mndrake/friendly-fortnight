@@ -48,18 +48,53 @@ def extract(config: str = _CONFIG_OPT,
         from .extract.connection import open_session
         session = open_session(cfg.connection)
     try:
-        from .extract import catalog, source, xref
+        from .extract import catalog, hostinfo, source, xref
         dbmod.reset_layer(con, "raw")
+        profile = hostinfo.probe(session)
+        profile.save(con)
+        typer.echo(f"host: {profile.version_label} "
+                   f"(IFS_READ={'yes' if profile.has_ifs_read else 'no'}, "
+                   f"source strategy="
+                   f"{source.resolve_strategy(cfg, profile)})")
         typer.echo("catalog:")
-        _echo_counts(catalog.harvest(session, con, cfg))
+        _echo_counts(catalog.harvest(session, con, cfg, profile))
         typer.echo("xref:")
         _echo_counts(xref.harvest(session, con, cfg))
         typer.echo("source:")
-        _echo_counts(source.harvest(session, con, cfg))
+        _echo_counts(source.harvest(session, con, cfg, profile))
         if not source.verify_roundtrip(con):
             typer.secho(
                 "WARNING: no non-blank source lines retrieved — possible "
                 "CCSID/translation problem", fg=typer.colors.YELLOW)
+    finally:
+        session.close()
+        con.close()
+
+
+@app.command()
+def probe(config: str = _CONFIG_OPT) -> None:
+    """Detect the host's DB2/OS version and catalog capabilities."""
+    cfg = _load(config)
+    con = _con(cfg)
+    from .extract import hostinfo, source
+    from .extract.connection import open_session
+    session = open_session(cfg.connection)
+    try:
+        prof = hostinfo.probe(session)
+        prof.save(con)
+        typer.echo(f"  version: {prof.version_label}")
+        if prof.product_version:
+            typer.echo(f"  jdbc product version: {prof.product_version}")
+        typer.echo(f"  QSYS2.IFS_READ available: {prof.has_ifs_read}")
+        typer.echo(f"  source retrieval (mode={cfg.source_retrieval}): "
+                   f"{source.resolve_strategy(cfg, prof)}")
+        for view in sorted(prof.catalog_columns):
+            typer.echo(f"  QSYS2.{view}: "
+                       f"{len(prof.catalog_columns[view])} columns")
+        if not prof.catalog_columns:
+            typer.secho("  WARNING: catalog introspection returned nothing — "
+                        "SELECTs will use documented default column names",
+                        fg=typer.colors.YELLOW)
     finally:
         session.close()
         con.close()

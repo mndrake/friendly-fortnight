@@ -60,9 +60,16 @@ For live-host extraction include the `host` extra (jaydebeapi/JPype):
    DDS/externally-described data PFs and CCSID-65535 source columns do this —
    so empty members automatically retry through the CREATE ALIAS path;
    set `source_retrieval: alias` to use aliases exclusively (older releases).
-3. Validate connectivity and outfile layouts first:
-   `uv run python scripts/smoke_host.py config.yaml` (checks JDBC, QCMDEXC,
-   the DSPPGMREF outfile column layout, and a source-member CCSID round-trip).
+3. Probe the host first: `uv run lineage probe` detects the DB2/OS version
+   (via JDBC `DatabaseMetaData` and `SYSIBMADM.ENV_SYS_INFO`), introspects
+   which columns each QSYS2 catalog view actually has on that release/TR, and
+   reports whether `QSYS2.IFS_READ` exists. Every catalog SELECT is then
+   built from the host's real column set — synonym candidates cover renames
+   across releases, missing optional columns are NULL-filled, and a missing
+   required column fails with an explicit message instead of a generic
+   column-not-found error. `uv run python scripts/smoke_host.py config.yaml`
+   additionally checks QCMDEXC, the DSPPGMREF outfile column layout, and a
+   source-member CCSID round-trip.
 4. Run the stages (each is re-runnable):
 
 ```sh

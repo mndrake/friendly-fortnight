@@ -1,14 +1,170 @@
 """QSYS2 catalog pulls: tables, columns, views, view dependencies, partitions.
 
-All reads are plain SELECTs against the QSYS2 catalog views, filtered to the
-configured libraries. Results land verbatim in the raw store.
+SELECT lists are built **adaptively** against the host's actual catalog shape
+(from :mod:`lineage.extract.hostinfo`): every column we want is declared as an
+ordered list of candidate names (TRs and releases rename/add columns), plus a
+required flag. Missing optional columns are NULL-filled; a missing required
+column fails loudly with the host's version in the message. When no profile is
+available (old stores, some tests), the first candidate of each column is
+used verbatim — the pre-probe behavior.
+
+Results land verbatim in the raw store.
 """
 from __future__ import annotations
 
-from typing import Any, Sequence
+from dataclasses import dataclass
+from typing import Optional, Sequence
 
 from ..db import insert_rows
 from .connection import HostSession, QueryResult
+from .hostinfo import HostProfile
+
+
+@dataclass(frozen=True)
+class ColSpec:
+    raw: str                       # raw-table column the value lands in
+    candidates: tuple[str, ...]    # catalog column names, preference order
+    required: bool = False
+
+    def pick(self, available: set[str]) -> Optional[str]:
+        if not available:
+            return self.candidates[0]
+        for cand in self.candidates:
+            if cand in available:
+                return cand
+        return None
+
+
+@dataclass(frozen=True)
+class PullSpec:
+    name: str
+    raw_table: str
+    catalog_view: str              # unqualified view name under QSYS2
+    schema_filter: str             # column filtering by library
+    cols: tuple[ColSpec, ...]
+
+    def build_select(self, available: set[str], libs_in: str
+                     ) -> tuple[str, list[str]]:
+        """Return (sql, missing_optional_raw_columns).
+
+        Raises ``CatalogShapeError`` when a required column has no available
+        candidate.
+        """
+        parts: list[str] = []
+        missing: list[str] = []
+        for col in self.cols:
+            picked = col.pick(available)
+            if picked is None:
+                if col.required:
+                    raise CatalogShapeError(self, col, available)
+                missing.append(col.raw)
+                parts.append(f"CAST(NULL AS VARCHAR(1)) AS {col.raw}")
+            else:
+                parts.append(f"{picked} AS {col.raw}")
+        sql = (f"SELECT {', '.join(parts)} FROM QSYS2.{self.catalog_view} "
+               f"WHERE {self.schema_filter} IN ({libs_in})")
+        return sql, missing
+
+
+class CatalogShapeError(RuntimeError):
+    def __init__(self, spec: PullSpec, col: ColSpec, available: set[str]):
+        super().__init__(
+            f"QSYS2.{spec.catalog_view} on this host has none of the "
+            f"candidate columns {col.candidates} needed for '{col.raw}'. "
+            f"Available columns: {sorted(available)}. Update the candidate "
+            f"list in extract/catalog.py for this release.")
+        self.spec = spec
+        self.col = col
+
+
+# Candidate lists reflect the documented QSYS2 catalog shapes; first entry is
+# the current name. Optional columns NULL-fill on hosts that lack them.
+PULLS: tuple[PullSpec, ...] = (
+    PullSpec(
+        name="systables", raw_table="raw_systables",
+        catalog_view="SYSTABLES", schema_filter="TABLE_SCHEMA",
+        cols=(
+            ColSpec("table_schema", ("TABLE_SCHEMA",), required=True),
+            ColSpec("table_name", ("TABLE_NAME",), required=True),
+            ColSpec("system_name", ("SYSTEM_TABLE_NAME",)),
+            ColSpec("table_type", ("TABLE_TYPE",), required=True),
+            ColSpec("file_type", ("FILE_TYPE",)),
+            # SYSTABLES has no row count; SYSPARTITIONSTAT carries it.
+            ColSpec("row_count", ("NUMBER_ROWS", "CARD")),
+            ColSpec("long_comment", ("LONG_COMMENT",)),
+        ),
+    ),
+    PullSpec(
+        name="syscolumns", raw_table="raw_syscolumns",
+        catalog_view="SYSCOLUMNS", schema_filter="TABLE_SCHEMA",
+        cols=(
+            ColSpec("table_schema", ("TABLE_SCHEMA",), required=True),
+            ColSpec("table_name", ("TABLE_NAME",), required=True),
+            ColSpec("system_name", ("SYSTEM_TABLE_NAME",)),
+            ColSpec("column_name", ("COLUMN_NAME",), required=True),
+            ColSpec("system_column", ("SYSTEM_COLUMN_NAME",)),
+            ColSpec("ordinal", ("ORDINAL_POSITION",), required=True),
+            ColSpec("data_type", ("DATA_TYPE",)),
+            ColSpec("length", ("LENGTH",)),
+            ColSpec("numeric_scale", ("NUMERIC_SCALE",)),
+            ColSpec("is_nullable", ("IS_NULLABLE",)),
+            ColSpec("column_heading", ("COLUMN_HEADING",)),
+        ),
+    ),
+    PullSpec(
+        name="sysviews", raw_table="raw_sysviews",
+        catalog_view="SYSVIEWS", schema_filter="TABLE_SCHEMA",
+        cols=(
+            ColSpec("table_schema", ("TABLE_SCHEMA",), required=True),
+            ColSpec("table_name", ("TABLE_NAME",), required=True),
+            ColSpec("system_name", ("SYSTEM_VIEW_NAME", "SYSTEM_TABLE_NAME")),
+            ColSpec("view_definition", ("VIEW_DEFINITION",), required=True),
+        ),
+    ),
+    PullSpec(
+        name="sysviewdep", raw_table="raw_sysviewdep",
+        catalog_view="SYSVIEWDEP", schema_filter="VIEW_SCHEMA",
+        cols=(
+            ColSpec("view_schema", ("VIEW_SCHEMA",), required=True),
+            ColSpec("view_name", ("VIEW_NAME",), required=True),
+            # Documented names are OBJECT_SCHEMA/OBJECT_NAME.
+            ColSpec("object_schema", ("OBJECT_SCHEMA", "TABLE_SCHEMA"),
+                    required=True),
+            ColSpec("object_name", ("OBJECT_NAME", "TABLE_NAME"),
+                    required=True),
+            ColSpec("object_type", ("OBJECT_TYPE",)),
+        ),
+    ),
+    PullSpec(
+        name="syspartitionstat", raw_table="raw_syspartitionstat",
+        catalog_view="SYSPARTITIONSTAT", schema_filter="TABLE_SCHEMA",
+        cols=(
+            ColSpec("table_schema", ("TABLE_SCHEMA",), required=True),
+            ColSpec("table_name", ("TABLE_NAME",), required=True),
+            ColSpec("system_name", ("SYSTEM_TABLE_NAME",)),
+            # Documented member-name column is TABLE_PARTITION.
+            ColSpec("partition_name", ("TABLE_PARTITION", "PARTITION_NAME"),
+                    required=True),
+            ColSpec("number_rows", ("NUMBER_ROWS",)),
+            ColSpec("source_type", ("SOURCE_TYPE",)),
+        ),
+    ),
+)
+
+RAW_COLUMNS: dict[str, list[str]] = {
+    "raw_systables": ["table_schema", "table_name", "system_name",
+                      "table_type", "file_type", "row_count", "long_comment"],
+    "raw_syscolumns": ["table_schema", "table_name", "system_name",
+                       "column_name", "system_column", "ordinal", "data_type",
+                       "length", "numeric_scale", "is_nullable",
+                       "column_heading"],
+    "raw_sysviews": ["table_schema", "table_name", "system_name",
+                     "view_definition"],
+    "raw_sysviewdep": ["view_schema", "view_name", "object_schema",
+                       "object_name", "object_type"],
+    "raw_syspartitionstat": ["table_schema", "table_name", "system_name",
+                             "partition_name", "number_rows", "source_type"],
+}
 
 
 def _in_list(libs: Sequence[str]) -> str:
@@ -21,72 +177,17 @@ def _fetch(session: HostSession, tag: str, sql: str) -> QueryResult:
     return session.query(sql)
 
 
-def harvest(session: HostSession, con, config) -> dict[str, int]:
+def harvest(session: HostSession, con, config,
+            profile: HostProfile | None = None) -> dict[str, int]:
     libs = _in_list(config.libraries)
     counts: dict[str, int] = {}
-
-    systables = _fetch(session, "catalog.systables", f"""
-        SELECT TABLE_SCHEMA, TABLE_NAME, SYSTEM_TABLE_NAME, TABLE_TYPE,
-               FILE_TYPE, CARD, LONG_COMMENT
-        FROM QSYS2.SYSTABLES
-        WHERE TABLE_SCHEMA IN ({libs})
-    """)
-    counts["raw_systables"] = insert_rows(
-        con, "raw_systables",
-        ["table_schema", "table_name", "system_name", "table_type",
-         "file_type", "row_count", "long_comment"],
-        [tuple(r) for r in systables.rows],
-    )
-
-    syscolumns = _fetch(session, "catalog.syscolumns", f"""
-        SELECT TABLE_SCHEMA, TABLE_NAME, SYSTEM_TABLE_NAME, COLUMN_NAME,
-               SYSTEM_COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE, LENGTH,
-               NUMERIC_SCALE, IS_NULLABLE, COLUMN_HEADING
-        FROM QSYS2.SYSCOLUMNS
-        WHERE TABLE_SCHEMA IN ({libs})
-    """)
-    counts["raw_syscolumns"] = insert_rows(
-        con, "raw_syscolumns",
-        ["table_schema", "table_name", "system_name", "column_name",
-         "system_column", "ordinal", "data_type", "length", "numeric_scale",
-         "is_nullable", "column_heading"],
-        [tuple(r) for r in syscolumns.rows],
-    )
-
-    sysviews = _fetch(session, "catalog.sysviews", f"""
-        SELECT TABLE_SCHEMA, TABLE_NAME, SYSTEM_VIEW_NAME, VIEW_DEFINITION
-        FROM QSYS2.SYSVIEWS
-        WHERE TABLE_SCHEMA IN ({libs})
-    """)
-    counts["raw_sysviews"] = insert_rows(
-        con, "raw_sysviews",
-        ["table_schema", "table_name", "system_name", "view_definition"],
-        [tuple(r) for r in sysviews.rows],
-    )
-
-    sysviewdep = _fetch(session, "catalog.sysviewdep", f"""
-        SELECT VIEW_SCHEMA, VIEW_NAME, TABLE_SCHEMA, TABLE_NAME, OBJECT_TYPE
-        FROM QSYS2.SYSVIEWDEP
-        WHERE VIEW_SCHEMA IN ({libs})
-    """)
-    counts["raw_sysviewdep"] = insert_rows(
-        con, "raw_sysviewdep",
-        ["view_schema", "view_name", "object_schema", "object_name",
-         "object_type"],
-        [tuple(r) for r in sysviewdep.rows],
-    )
-
-    partstat = _fetch(session, "catalog.syspartitionstat", f"""
-        SELECT TABLE_SCHEMA, TABLE_NAME, SYSTEM_TABLE_NAME, PARTITION_NAME,
-               NUMBER_ROWS, SOURCE_TYPE
-        FROM QSYS2.SYSPARTITIONSTAT
-        WHERE TABLE_SCHEMA IN ({libs})
-    """)
-    counts["raw_syspartitionstat"] = insert_rows(
-        con, "raw_syspartitionstat",
-        ["table_schema", "table_name", "system_name", "partition_name",
-         "number_rows", "source_type"],
-        [tuple(r) for r in partstat.rows],
-    )
-
+    for spec in PULLS:
+        available = profile.columns_of(spec.catalog_view) if profile else set()
+        sql, missing = spec.build_select(available, libs)
+        if missing:
+            counts[f"{spec.name}_missing_columns"] = len(missing)
+        res = _fetch(session, f"catalog.{spec.name}", sql)
+        counts[spec.raw_table] = insert_rows(
+            con, spec.raw_table, RAW_COLUMNS[spec.raw_table],
+            [tuple(r) for r in res.rows])
     return counts

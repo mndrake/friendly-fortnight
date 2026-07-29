@@ -20,7 +20,7 @@ LAYER_TABLES: dict[str, tuple[str, ...]] = {
     "raw": (
         "raw_systables", "raw_syscolumns", "raw_sysviews", "raw_sysviewdep",
         "raw_syspartitionstat", "raw_dsppgmref", "raw_dspdbr", "raw_dspffd",
-        "raw_source_members",
+        "raw_source_members", "host_profile",
     ),
     "parsed": (
         "parsed_cl_statements", "parsed_cl_overrides", "parsed_cl_calls",

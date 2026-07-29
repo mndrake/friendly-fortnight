@@ -39,8 +39,8 @@ Rules that must hold:
   `HostSession` protocol (`extract/connection.py`). Parsers, graph, analysis,
   and reports read DuckDB only. Host access is read-only; host commands go
   through `QSYS2.QCMDEXC`; outfiles land in the configured scratch library.
-  Source member text is read via `QSYS2.IFS_READ` by default
-  (`source_retrieval: ifs_read`, stateless, no scratch objects). IFS_READ
+  Source member text retrieval defaults to `source_retrieval: auto` — the
+  probe picks IFS_READ when the host has it, alias otherwise. IFS_READ
   signals a failed open as zero rows + a job-log warning, not an SQL error
   (data-PF members, CCSID 65535), so an empty result auto-falls-back to the
   `alias` strategy (CREATE/DROP ALIAS in scratch_lib) per member; `alias`
@@ -52,6 +52,17 @@ Rules that must hold:
 - Outfile record layouts (DSPPGMREF/DSPDBR/DSPFFD in `extract/xref.py`) are
   mapped **by field name, never by position**; a missing field must raise,
   not shift columns.
+- QSYS2 catalog SELECTs are **capability-driven**, never hardcoded: the host
+  probe (`extract/hostinfo.py`, run at the start of `extract` and by
+  `lineage probe`) records the DB2/OS version (JDBC `DatabaseMetaData` +
+  `SYSIBMADM.ENV_SYS_INFO`), introspects each QSYS2 view's actual columns
+  from `QSYS2.SYSCOLUMNS`, and checks for `QSYS2.IFS_READ`. Catalog pulls in
+  `extract/catalog.py` declare per-column candidate-name lists (synonyms
+  across releases/TRs) with required flags — optional misses NULL-fill,
+  required misses raise `CatalogShapeError`. When adding a catalog column,
+  add it as a candidate list, not a bare name (e.g. member name is
+  `TABLE_PARTITION`, view deps use `OBJECT_SCHEMA`/`OBJECT_NAME`, SYSTABLES
+  has no row-count column).
 
 ## Lineage semantics
 

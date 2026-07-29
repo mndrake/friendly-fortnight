@@ -27,6 +27,7 @@ from typing import Any
 from ..config import Config, SourceFileRef
 from ..db import insert_rows
 from .connection import HostSession, QueryResult
+from .hostinfo import HostProfile
 
 
 def _fetch(session: HostSession, tag: str, sql: str) -> QueryResult:
@@ -35,12 +36,28 @@ def _fetch(session: HostSession, tag: str, sql: str) -> QueryResult:
     return session.query(sql)
 
 
-def enumerate_members(session: HostSession, src: SourceFileRef) -> list[dict[str, Any]]:
-    """List members of a source physical file with their source type."""
+def enumerate_members(session: HostSession, src: SourceFileRef,
+                      profile: "HostProfile | None" = None) -> list[dict[str, Any]]:
+    """List members of a source physical file with their source type.
+
+    The member-name column is ``TABLE_PARTITION`` in the documented
+    SYSPARTITIONSTAT shape; the host profile decides when an alternate name
+    applies.
+    """
+    member_col, type_col = "TABLE_PARTITION", "SOURCE_TYPE"
+    if profile is not None:
+        available = profile.columns_of("SYSPARTITIONSTAT")
+        if available:
+            for cand in ("TABLE_PARTITION", "PARTITION_NAME"):
+                if cand in available:
+                    member_col = cand
+                    break
+            if "SOURCE_TYPE" not in available:
+                type_col = "CAST(NULL AS VARCHAR(10))"
     res = _fetch(
         session, f"source.members.{src.library}.{src.file}",
         f"""
-        SELECT PARTITION_NAME AS member, SOURCE_TYPE AS member_type
+        SELECT {member_col} AS member, {type_col} AS member_type
         FROM QSYS2.SYSPARTITIONSTAT
         WHERE TABLE_SCHEMA = '{src.library}' AND TABLE_NAME = '{src.file}'
         """,
@@ -54,22 +71,45 @@ def ifs_member_path(src: SourceFileRef, member: str) -> str:
             f"{src.file.upper()}.FILE/{member.upper()}.MBR")
 
 
+def resolve_strategy(config: Config,
+                     profile: HostProfile | None = None) -> str:
+    """Resolve the configured retrieval mode to a concrete strategy.
+
+    ``auto`` uses IFS_READ when the host profile confirms QSYS2.IFS_READ
+    exists, else the alias path; without a profile it optimistically tries
+    IFS_READ (the per-member fallback still protects each read).
+    """
+    mode = config.source_retrieval
+    if mode != "auto":
+        return mode
+    if profile is not None and not profile.has_ifs_read:
+        return "alias"
+    return "ifs_read"
+
+
 def retrieve_member(session: HostSession, src: SourceFileRef, member: str,
-                    config: Config) -> tuple[list[tuple[int, str]], str]:
+                    config: Config,
+                    profile: HostProfile | None = None
+                    ) -> tuple[list[tuple[int, str]], str]:
     """Retrieve one member's lines as ``(seq, text)``.
 
     Returns ``(lines, strategy_used)``. In ``ifs_read`` mode an empty result
-    triggers a per-member fallback to the alias strategy: IFS_READ reports a
-    failed open as *zero rows plus a job-log warning*, not an SQL error —
-    which happens for members of DDS/externally described data PFs (text-mode
-    QSYS.LIB access only supports source PFs and single-field
-    program-described PFs) and for SRCDTA CCSID 65535 (no conversion). The
-    alias path is plain record-level SQL and works for all of these.
+    or an SQL error triggers a per-member fallback to the alias strategy:
+    IFS_READ reports a failed open as *zero rows plus a job-log warning*, not
+    an SQL error — which happens for members of DDS/externally described data
+    PFs (text-mode QSYS.LIB access only supports source PFs and single-field
+    program-described PFs) and for SRCDTA CCSID 65535 (no conversion) — and
+    raises outright on releases without the function. The alias path is plain
+    record-level SQL and works for all of these.
     """
-    if config.source_retrieval == "alias":
+    strategy = resolve_strategy(config, profile)
+    if strategy == "alias":
         return retrieve_member_alias(session, src, member,
                                      config.scratch_lib), "alias"
-    lines = retrieve_member_ifs(session, src, member)
+    try:
+        lines = retrieve_member_ifs(session, src, member)
+    except Exception:  # noqa: BLE001 - e.g. IFS_READ absent on this release
+        lines = []
     if lines:
         return lines, "ifs_read"
     fallback = retrieve_member_alias(session, src, member, config.scratch_lib)
@@ -131,15 +171,17 @@ def _drop_alias(session: HostSession, alias: str) -> None:
         pass
 
 
-def harvest(session: HostSession, con, config: Config) -> dict[str, int]:
+def harvest(session: HostSession, con, config: Config,
+            profile: HostProfile | None = None) -> dict[str, int]:
     """Enumerate and retrieve every member of every configured source file."""
     rows: list[tuple[Any, ...]] = []
     fallbacks = 0
     for src in config.source_files:
-        for m in enumerate_members(session, src):
+        for m in enumerate_members(session, src, profile):
             member = m["member"]
             member_type = m.get("member_type")
-            lines, strategy = retrieve_member(session, src, member, config)
+            lines, strategy = retrieve_member(session, src, member, config,
+                                              profile)
             if strategy == "alias_fallback":
                 fallbacks += 1
             for seq, text in lines:

@@ -25,6 +25,19 @@ def main() -> int:
     session = open_session(cfg.connection)
     ok = True
     try:
+        # 0. Version + capability probe.
+        from lineage.extract import hostinfo
+        from lineage.extract.source import resolve_strategy
+        prof = hostinfo.probe(session)
+        print(f"[0] host: {prof.version_label} "
+              f"(jdbc: {prof.product_version or 'n/a'}); "
+              f"IFS_READ={'yes' if prof.has_ifs_read else 'no'}; "
+              f"source strategy ({cfg.source_retrieval}) -> "
+              f"{resolve_strategy(cfg, prof)}")
+        if not prof.catalog_columns:
+            print("    WARNING: catalog introspection empty — extraction "
+                  "will use documented default column names")
+
         # 1. Catalog answers.
         r = session.query(
             "SELECT COUNT(*) FROM QSYS2.SYSTABLES WHERE TABLE_SCHEMA = ?",

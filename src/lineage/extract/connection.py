@@ -107,6 +107,15 @@ class JdbcHostSession:
         finally:
             cur.close()
 
+    def database_version(self) -> dict[str, str]:
+        """DB2/OS version from JDBC DatabaseMetaData — no SQL involved."""
+        md = self._conn.jconn.getMetaData()
+        return {
+            "product_name": str(md.getDatabaseProductName()),
+            "product_version": str(md.getDatabaseProductVersion()),
+            "driver_version": str(md.getDriverVersion()),
+        }
+
     def close(self) -> None:
         if self._conn is not None:
             try:
@@ -135,6 +144,15 @@ class FixtureHostSession:
         self.cl_log: list[str] = []
         self.sql_log: list[str] = []
         self._last_tag: str | None = None
+        # Overridable stand-in for JDBC DatabaseMetaData.
+        self.version_info: dict[str, str] = {
+            "product_name": "DB2 UDB for AS/400",
+            "product_version": "07.04.0000 V7R4m0",
+            "driver_version": "fixture",
+        }
+
+    def database_version(self) -> dict[str, str]:
+        return dict(self.version_info)
 
     def with_tag(self, tag: str) -> "FixtureHostSession":
         """Return a shallow view whose next query resolves under ``tag``.
