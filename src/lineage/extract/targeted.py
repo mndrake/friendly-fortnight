@@ -256,19 +256,37 @@ def harvest_targeted(session: HostSession, con, config: Config,
             dynamic_keys.add(key)
             dynamic_source_files.append(SourceFileRef(library=lib, file=file))
 
+    enumeration_failures: set[str] = set()
+
     def _enumerate_cached(lib: str, file: str) -> list[dict]:
         key = f"{lib.upper()}/{file.upper()}"
         if key not in member_cache:
-            member_cache[key] = enumerate_members(
-                session, SourceFileRef(library=lib, file=file), profile)
+            try:
+                member_cache[key] = enumerate_members(
+                    session, SourceFileRef(library=lib, file=file), profile)
+            except Exception:  # noqa: BLE001
+                # Discovered source files carry no operator guarantee (unlike
+                # the configured list): a failed enumeration must not abort
+                # the whole extraction. Objects whose only source lived here
+                # surface as missing_source gaps at graph build.
+                member_cache[key] = []
+                enumeration_failures.add(key)
         return member_cache[key]
 
     def _retrieve_and_discover(lib: str, srcfile: str, member: str,
                                mtype: str | None, round_no: int) -> None:
         nonlocal n_members_retrieved, n_source_lines
         src_ref = SourceFileRef(library=lib, file=srcfile)
-        lines, _strategy = retrieve_member(session, src_ref, member, config,
-                                           profile)
+        try:
+            lines, _strategy = retrieve_member(session, src_ref, member,
+                                               config, profile)
+        except Exception:  # noqa: BLE001
+            # Same rationale as _enumerate_cached: a discovered member that
+            # fails to read must not abort the extraction; the object shows
+            # up as missing_source at graph build.
+            enumeration_failures.add(f"{lib.upper()}/{srcfile.upper()}"
+                                     f"({member.upper()})")
+            return
         rows = [(lib, srcfile, member, mtype, seq, text) for seq, text in lines]
         n_members_retrieved += 1
         n_source_lines += insert_rows(
@@ -369,7 +387,16 @@ def harvest_targeted(session: HostSession, con, config: Config,
             if kind == "member":
                 fallback_names.add(name)
             elif kind in ("program", "file"):
-                if not lib or src_locations.get((kind, lib, name)) is None:
+                if not lib:
+                    # No library to probe with — name-matching is the only
+                    # possible path.
+                    fallback_names.add(name)
+                elif (kind, lib, name) in src_locations \
+                        and src_locations[(kind, lib, name)] is None:
+                    # Probed and missed. An entry discovered mid-round (not
+                    # yet probed) must NOT fall through here: it waits for
+                    # next round's objstat pass, otherwise a same-named decoy
+                    # member could be fetched alongside the recorded one.
                     fallback_names.add(name)
         if fallback_names:
             for src in dynamic_source_files:
@@ -402,6 +429,8 @@ def harvest_targeted(session: HostSession, con, config: Config,
     counts["slice.source_files_discovered"] = (
         len(dynamic_source_files) - n_configured_source_files)
     counts["slice.libraries_discovered"] = len(libraries_discovered)
+    if enumeration_failures:
+        counts["slice.enumeration_failures"] = len(enumeration_failures)
     return counts
 
 

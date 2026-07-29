@@ -562,3 +562,68 @@ def test_targeted_discovers_source_files_without_config(session, config):
         "SELECT DISTINCT member FROM raw_source_members").fetchall()}
     assert {"RPT001", "RPT002", "SQLEXT", "CUSTMAST", "ORDERS"} <= members
     con.close()
+
+
+# --- Robustness: failures on discovered source locations must not abort -------
+
+def test_discovered_enumeration_failure_degrades_gracefully():
+    """objstat points WRITER's source at a file the host cannot enumerate or
+    read (no fixture responses at all) — the run must complete, count the
+    failure, and leave WRITER as a missing-source case rather than crash."""
+    from lineage.extract import targeted
+
+    session = _synthetic_session(["WRITER"], extra_responses={
+        "objstat.TESTLIB.WRITER.pgm": QueryResult(
+            columns=["SOURCE_LIBRARY", "SOURCE_FILE", "SOURCE_MEMBER"],
+            rows=[("TESTLIB", "QRPGSRC2", "WRITERSRC")]),
+    })
+    con = dbmod.connect(None)
+    counts = targeted.harvest_targeted(session, con, _synthetic_config())
+
+    assert counts.get("slice.enumeration_failures", 0) >= 1
+    members = {r[0] for r in con.execute(
+        "SELECT DISTINCT member FROM raw_source_members").fetchall()}
+    assert "WRITERSRC" not in members   # unreadable, skipped — not fatal
+    con.close()
+
+
+def test_mid_round_discovery_waits_for_objstat_no_decoy_fetch():
+    """A program discovered mid-round (HELPER, via WRITER's CALL) must be
+    objstat-probed before name-matching: its recorded member is HELPERSRC,
+    and a same-named decoy member HELPER exists in the same source file. Only
+    the recorded member may be fetched."""
+    from lineage.extract import targeted
+
+    helper_src_text = ["PGM", "ENDPGM"]
+    decoy_text = ["PGM", "/* DECOY - MUST NOT BE FETCHED */", "ENDPGM"]
+    session = _synthetic_session(["WRITER"], extra_responses={
+        # WRITER's member reveals the call to HELPER.
+        "source.text.TESTLIB.QCLSRC.WRITER": QueryResult(
+            columns=["SRCSEQ", "SRCDTA"],
+            rows=[(1, "PGM"), (2, "CALL PGM(TESTLIB/HELPER)"), (3, "ENDPGM")]),
+        # Enumeration lists both the decoy and the recorded member.
+        "source.members.TESTLIB.QCLSRC": QueryResult(
+            columns=["member", "member_type"],
+            rows=[("WRITER", "CLP"), ("HELPER", "CLP"), ("HELPERSRC", "CLP")]),
+        "source.text.TESTLIB.QCLSRC.HELPER": QueryResult(
+            columns=["SRCSEQ", "SRCDTA"],
+            rows=[(i + 1, ln) for i, ln in enumerate(decoy_text)]),
+        "source.text.TESTLIB.QCLSRC.HELPERSRC": QueryResult(
+            columns=["SRCSEQ", "SRCDTA"],
+            rows=[(i + 1, ln) for i, ln in enumerate(helper_src_text)]),
+        "objstat.TESTLIB.HELPER.pgm": QueryResult(
+            columns=["SOURCE_LIBRARY", "SOURCE_FILE", "SOURCE_MEMBER"],
+            rows=[("TESTLIB", "QCLSRC", "HELPERSRC")]),
+    })
+    con = dbmod.connect(None)
+    targeted.harvest_targeted(session, con, _synthetic_config())
+
+    members = {r[0] for r in con.execute(
+        "SELECT DISTINCT member FROM raw_source_members").fetchall()}
+    assert "HELPERSRC" in members       # the recorded member
+    assert "HELPER" not in members      # the decoy stayed unfetched
+    src_ref = con.execute(
+        "SELECT source_ref FROM slice_objects WHERE kind='program' AND "
+        "name='HELPER'").fetchone()[0]
+    assert src_ref == "TESTLIB/QCLSRC(HELPERSRC)"
+    con.close()
