@@ -156,6 +156,116 @@ def test_pairs_filter_single_chunk_under_limit():
     assert len(fragments) == 1
 
 
+# --- Full-mode regression: multi-library command order ------------------------
+
+def test_full_mode_command_order_per_library(con, session):
+    """Full-mode xref.harvest must interleave PGMREF -> FFD -> DBR per
+    library (the original pre-refactor order), not group commands by verb."""
+    from lineage.extract import xref
+
+    config2 = from_dict({
+        "scratch_lib": "QTEMP",
+        "libraries": [LIB, "APPLIB2"],
+        "output_seeds": [{"id": "X", "library": LIB, "file": "CUSTRPT"}],
+        "liblists": {"default": [LIB]},
+    })
+    xref.harvest(session, con, config2)
+    verbs = [(c.split()[0], c.split("(")[1].split("/")[0])
+             for c in session.cl_log]
+    assert verbs == [
+        ("DSPPGMREF", "APPLIB"), ("DSPFFD", "APPLIB"), ("DSPDBR", "APPLIB"),
+        ("DSPPGMREF", "APPLIB2"), ("DSPFFD", "APPLIB2"), ("DSPDBR", "APPLIB2"),
+    ]
+
+
+# --- Slice identity: same name, different libraries ----------------------------
+
+def test_slice_distinguishes_same_name_across_libraries():
+    from lineage.extract.targeted import _Slice
+
+    sl = _Slice()
+    assert sl.add("file", "LIB1", "DUPNAME", 0, "seed")
+    assert sl.add("file", "LIB2", "DUPNAME", 1, "cpyf")
+    assert sl.of_kind("file") == {("LIB1", "DUPNAME"), ("LIB2", "DUPNAME")}
+    assert len(sl) == 2
+
+
+def test_slice_placeholder_upgrade_reports_change():
+    from lineage.extract.targeted import _Slice
+
+    sl = _Slice()
+    assert sl.add("program", None, "PGMX", 0, "cl_call")
+    # Resolving the library later is a change (its pulls are now pending)...
+    assert sl.add("program", "LIB1", "PGMX", 1, "backward_walk")
+    assert sl.of_kind("program") == {("LIB1", "PGMX")}
+    # ...but the original round/reason are preserved.
+    assert dict(zip(("kind", "lib", "name", "round", "reason"),
+                    sl.rows()[0]))["reason"] == "cl_call"
+    # A later unqualified mention is satisfied by the existing entry.
+    assert not sl.add("program", None, "PGMX", 2, "cl_call")
+
+
+# --- Targeted mode never touches unconfigured libraries ------------------------
+
+def test_targeted_never_pulls_outside_configured_libraries():
+    """A CPYF referencing OTHERLIB (not in config.libraries) must not cause
+    DSPFFD/DSPDBR against OTHERLIB — full mode would never touch it either.
+    The file still enters the slice for the audit trail."""
+    from lineage.extract import targeted
+
+    responses: dict[str, QueryResult] = {}
+    for tag in ("catalog.systables", "catalog.sysviews", "catalog.sysviewdep",
+               "catalog.syscolumns", "catalog.syspartitionstat"):
+        responses[tag] = QueryResult(columns=["a"], rows=[])
+    responses["xref.dsppgmref"] = QueryResult(
+        columns=["program_lib", "program_name", "object_lib", "object_name",
+                 "object_type", "usage_flag", "ref_count"],
+        rows=[("TESTLIB", "WRITER", "TESTLIB", "OUT1", "F", "2", 1)],
+    )
+    responses["xref.dspffd"] = QueryResult(
+        columns=["file_lib", "file_name", "record_format", "field_name",
+                 "field_type", "field_length", "field_scale", "field_text",
+                 "field_ordinal"], rows=[])
+    responses["xref.dspdbr"] = QueryResult(
+        columns=["dep_lib", "dep_file", "based_lib", "based_file", "dep_type"],
+        rows=[])
+    responses["source.members.TESTLIB.QCLSRC"] = QueryResult(
+        columns=["member", "member_type"], rows=[("WRITER", "CLP")])
+    responses["source.text.TESTLIB.QCLSRC.WRITER"] = QueryResult(
+        columns=["SRCSEQ", "SRCDTA"],
+        rows=[(1, "PGM"),
+              (2, "CPYF FROMFILE(OTHERLIB/EXTFILE) TOFILE(TESTLIB/OUT1)"),
+              (3, "ENDPGM")])
+    session = FixtureHostSession(responses=responses)
+    con = dbmod.connect(None)
+    counts = targeted.harvest_targeted(session, con, _synthetic_config())
+
+    assert not any("OTHERLIB" in c for c in session.cl_log)
+    sl = _slice_rows(con)
+    assert ("file", "OTHERLIB", "EXTFILE") in sl   # audited, never pulled
+    con.close()
+
+
+# --- Idempotency of the scoped pulls without an external reset ------------------
+
+def test_harvest_targeted_twice_does_not_duplicate(config, session):
+    import conftest as conftest_mod
+    from lineage.extract import hostinfo, targeted
+
+    con = dbmod.connect(None)
+    profile = hostinfo.probe(session)
+    targeted.harvest_targeted(session, con, config, profile)
+    tables = ("raw_syscolumns", "raw_syspartitionstat", "raw_dspffd",
+              "raw_dspdbr", "slice_objects")
+    before = {t: dbmod.table_count(con, t) for t in tables}
+    # Fresh session (fixture tag state), same store, no raw-layer reset.
+    session2 = conftest_mod.build_session()
+    targeted.harvest_targeted(session2, con, config, profile)
+    after = {t: dbmod.table_count(con, t) for t in tables}
+    assert after == before
+    con.close()
+
+
 # --- Synthetic estate: iteration/closure and the round cap --------------------
 
 def _cl_member(*lines: str) -> str:

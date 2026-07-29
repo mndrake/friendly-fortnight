@@ -186,13 +186,18 @@ DBR_COLUMNS = ["dep_lib", "dep_file", "based_lib", "based_file", "dep_type"]
 
 
 def harvest_pgmref(session: HostSession, con, config,
-                   scratch_lib: str | None = None) -> dict[str, int]:
-    """DSPPGMREF PGM(lib/*ALL) per configured library — full-scope, always."""
+                   scratch_lib: str | None = None,
+                   libraries: "Sequence[str] | None" = None) -> dict[str, int]:
+    """DSPPGMREF PGM(lib/*ALL) per library — full-scope, always.
+
+    ``libraries`` defaults to the configured scan list; :func:`harvest` passes
+    one library at a time to preserve the per-library command interleaving.
+    """
     from ..db import insert_rows
 
     scratch = scratch_lib or config.scratch_lib
     counts = {"raw_dsppgmref": 0}
-    for lib in config.libraries:
+    for lib in (config.libraries if libraries is None else libraries):
         pgm_of = f"{scratch}/PGMREF"
         session.run_cl(
             f"DSPPGMREF PGM({lib}/*ALL) OUTPUT(*OUTFILE) OUTFILE({pgm_of})"
@@ -205,7 +210,8 @@ def harvest_pgmref(session: HostSession, con, config,
 
 def harvest_ffd(session: HostSession, con, config,
                 files: "Sequence[tuple[str, str]] | None" = None,
-                scratch_lib: str | None = None) -> dict[str, int]:
+                scratch_lib: str | None = None,
+                libraries: "Sequence[str] | None" = None) -> dict[str, int]:
     """DSPFFD outfile harvest.
 
     ``files=None`` (default) reproduces today's behavior: one
@@ -225,7 +231,7 @@ def harvest_ffd(session: HostSession, con, config,
     scratch = scratch_lib or config.scratch_lib
     counts = {"raw_dspffd": 0}
     if files is None:
-        for lib in config.libraries:
+        for lib in (config.libraries if libraries is None else libraries):
             ffd_of = f"{scratch}/FFD"
             session.run_cl(
                 f"DSPFFD FILE({lib}/*ALL) OUTPUT(*OUTFILE) OUTFILE({ffd_of})"
@@ -254,7 +260,8 @@ def harvest_ffd(session: HostSession, con, config,
 
 def harvest_dbr(session: HostSession, con, config,
                 files: "Sequence[tuple[str, str]] | None" = None,
-                scratch_lib: str | None = None) -> dict[str, int]:
+                scratch_lib: str | None = None,
+                libraries: "Sequence[str] | None" = None) -> dict[str, int]:
     """DSPDBR outfile harvest — dependent (logical) -> based-on (physical).
 
     Same ``files=None`` vs. per-file scoping and dedup/filter rules as
@@ -265,7 +272,7 @@ def harvest_dbr(session: HostSession, con, config,
     scratch = scratch_lib or config.scratch_lib
     counts = {"raw_dspdbr": 0}
     if files is None:
-        for lib in config.libraries:
+        for lib in (config.libraries if libraries is None else libraries):
             dbr_of = f"{scratch}/DBR"
             session.run_cl(
                 f"DSPDBR FILE({lib}/*ALL) OUTPUT(*OUTFILE) OUTFILE({dbr_of})"
@@ -309,10 +316,21 @@ def harvest(session: HostSession, con, config, scratch_lib: str | None = None) -
     (:mod:`lineage.extract.targeted`) calls the three sub-functions directly
     with a ``files`` scope.
     """
-    counts: dict[str, int] = {}
-    counts.update(harvest_pgmref(session, con, config, scratch_lib=scratch_lib))
-    counts.update(harvest_ffd(session, con, config, scratch_lib=scratch_lib))
-    counts.update(harvest_dbr(session, con, config, scratch_lib=scratch_lib))
+    counts = {"raw_dsppgmref": 0, "raw_dspffd": 0, "raw_dspdbr": 0}
+    # Per library, PGMREF -> FFD -> DBR — the exact command order of the
+    # original single-function harvest, so full mode stays byte-identical
+    # on multi-library configs.
+    for lib in config.libraries:
+        for sub in (
+            harvest_pgmref(session, con, config, scratch_lib=scratch_lib,
+                           libraries=[lib]),
+            harvest_ffd(session, con, config, scratch_lib=scratch_lib,
+                        libraries=[lib]),
+            harvest_dbr(session, con, config, scratch_lib=scratch_lib,
+                        libraries=[lib]),
+        ):
+            for k, v in sub.items():
+                counts[k] += v
     return counts
 
 

@@ -235,12 +235,34 @@ def harvest(session: HostSession, con, config,
                 continue
         available = profile.columns_of(spec.catalog_view) if profile else set()
         if pairs is not None:
+            # Skip pairs whose rows are already in the raw table, and filter
+            # returned rows to the requested pairs: repeat scoped calls across
+            # targeted rounds stay idempotent, and a fixture session (which
+            # serves the same canned response for every chunk) cannot smuggle
+            # extra rows in. Raw column 0/1 are the schema/name columns for
+            # every scopable view.
+            lib_col, name_col = RAW_COLUMNS[spec.raw_table][:2]
+            existing = {
+                ((l or "").upper(), (n or "").upper())
+                for l, n in con.execute(
+                    f"SELECT DISTINCT {lib_col}, {name_col} "
+                    f"FROM {spec.raw_table}").fetchall()
+            }
+            todo_set = {(l.upper(), n.upper()) for l, n in pairs} - existing
+            todo = sorted(todo_set)
+            if not todo:
+                counts[spec.raw_table] = 0
+                continue
             rows: list[tuple] = []
             missing: list[str] = []
-            for frag in pairs_filter(spec.schema_filter, "TABLE_NAME", pairs):
+            for frag in pairs_filter(spec.schema_filter, "TABLE_NAME", todo):
                 sql, missing = spec.build_select(available, libs, extra_where=frag)
                 res = _fetch(session, f"catalog.{spec.name}", sql)
-                rows.extend(tuple(r) for r in res.rows)
+                rows.extend(
+                    tuple(r) for r in res.rows
+                    if (str(r[0] or "").upper(), str(r[1] or "").upper())
+                    in todo_set
+                )
             if missing:
                 counts[f"{spec.name}_missing_columns"] = len(missing)
             counts[spec.raw_table] = insert_rows(

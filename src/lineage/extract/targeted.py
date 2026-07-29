@@ -48,40 +48,54 @@ def _add_prefixed(counts: dict[str, int], prefix: str, sub: dict[str, int]) -> N
 
 
 class _Slice:
-    """Slice membership, keyed by (kind, name) — matching the member-name
-    convention used for source retrieval. First round/reason wins; a later
-    ``add`` with a resolved library fills in a library discovered as None
-    earlier (e.g. an unqualified CL CALL target already in the slice from
-    the backward walk with its library known).
+    """Slice membership, keyed by (kind, library, name).
+
+    Two same-named objects in *different* libraries are distinct slice
+    entries — each gets its own host pulls. A library-less entry (unqualified
+    reference that could not be resolved) is a placeholder: a later ``add``
+    of the same (kind, name) with a resolved library *upgrades* it in place
+    (and reports a change, so the round loop knows new pulls are pending);
+    conversely a library-less ``add`` is satisfied by any existing entry of
+    that (kind, name). First round/reason wins on upgrades.
     """
 
     def __init__(self) -> None:
-        self._entries: dict[tuple[str, str], dict] = {}
+        self._entries: dict[tuple[str, Optional[str], str], dict] = {}
 
     def add(self, kind: str, library: Optional[str], name: str, round_: int,
             reason: str) -> bool:
+        """Returns True when the slice changed (new entry or upgraded lib)."""
         if not name:
             return False
-        key = (kind, name.strip().upper())
+        name = name.strip().upper()
         lib = library.upper() if library else None
-        existing = self._entries.get(key)
-        if existing is not None:
-            if existing["library"] is None and lib is not None:
-                existing["library"] = lib
+        if (kind, lib, name) in self._entries:
             return False
-        self._entries[key] = {"library": lib, "round": round_, "reason": reason}
+        same_name = [k for k in self._entries if k[0] == kind and k[2] == name]
+        if lib is None:
+            # Unqualified reference: any existing entry of this name covers it.
+            if same_name:
+                return False
+        else:
+            placeholder = (kind, None, name)
+            if placeholder in self._entries:
+                entry = self._entries.pop(placeholder)
+                entry["library"] = lib
+                self._entries[(kind, lib, name)] = entry
+                return True
+        self._entries[(kind, lib, name)] = {
+            "library": lib, "round": round_, "reason": reason}
         return True
 
     def names(self) -> set[str]:
-        return {name for _, name in self._entries}
+        return {name for _, _, name in self._entries}
 
     def of_kind(self, kind: str) -> set[tuple[Optional[str], str]]:
-        return {(e["library"], name) for (k, name), e in self._entries.items()
-                if k == kind}
+        return {(lib, name) for (k, lib, name) in self._entries if k == kind}
 
     def rows(self) -> list[tuple]:
-        return [(kind, e["library"], name, e["round"], e["reason"])
-                for (kind, name), e in self._entries.items()]
+        return [(kind, lib, name, e["round"], e["reason"])
+                for (kind, lib, name), e in self._entries.items()]
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -132,6 +146,9 @@ def harvest_targeted(session: HostSession, con, config: Config,
     from .source import enumerate_members, retrieve_member
 
     counts: dict[str, int] = {}
+    # Idempotency: a repeat call on the same store must not stack audit rows
+    # (the CLI resets the whole raw layer first, but direct callers may not).
+    con.execute("DELETE FROM slice_objects")
 
     # -- 1. Seed pass: cheap, broad -----------------------------------------
     _add_prefixed(counts, "catalog", catalog.harvest(
@@ -174,16 +191,24 @@ def harvest_targeted(session: HostSession, con, config: Config,
     member_cache: dict[str, list[dict]] = {}   # srcfile -> enumerate_members()
     fetched_members: set[str] = set()          # member names already retrieved
     n_members_retrieved = 0
+    n_source_lines = 0
     rounds_run = 0
     seen_files: set[tuple[str, str]] = set()   # (lib, name) already round-processed
+    # Targeted mode must only ever narrow full mode's pulls: a slice file in
+    # a library outside the configured scan set is never pulled (full mode
+    # would not touch that library either) — it surfaces as an outside_scope
+    # gap at graph build, same as in full mode.
+    allowed_libs = {lib.upper() for lib in config.libraries}
 
     for round_no in range(1, MAX_ROUNDS + 1):
         new_files = [(lib, name) for lib, name in sl.of_kind("file")
-                    if (lib, name) not in seen_files and lib]
-        # Files with no resolvable library can't be scoped on the host; they
-        # stay in the slice (for member-name matching) but are never pulled.
+                    if (lib, name) not in seen_files
+                    and lib and lib.upper() in allowed_libs]
+        # Files with no resolvable library, or in an unconfigured library,
+        # can't/mustn't be pulled; they stay in the slice (for member-name
+        # matching and the audit trail) but are marked processed.
         for lib, name in sl.of_kind("file"):
-            if not lib:
+            if not lib or lib.upper() not in allowed_libs:
                 seen_files.add((lib, name))
         for pair in new_files:
             seen_files.add(pair)
@@ -231,7 +256,8 @@ def harvest_targeted(session: HostSession, con, config: Config,
             lines, _strategy = retrieve_member(session, src_ref, member, config,
                                                profile)
             rows = [(lib, srcfile, member, mtype, seq, text) for seq, text in lines]
-            n_members_retrieved += insert_rows(
+            n_members_retrieved += 1
+            n_source_lines += insert_rows(
                 con, "raw_source_members",
                 ["library", "srcfile", "member", "member_type", "seq", "line_text"],
                 rows)
@@ -252,6 +278,7 @@ def harvest_targeted(session: HostSession, con, config: Config,
     counts["slice.programs"] = len(sl.of_kind("program"))
     counts["slice.files"] = len(sl.of_kind("file"))
     counts["slice.members_retrieved"] = n_members_retrieved
+    counts["slice.source_lines"] = n_source_lines
     counts["slice.total_objects"] = len(sl)
     return counts
 
