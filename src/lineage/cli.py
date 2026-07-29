@@ -37,10 +37,18 @@ def _echo_counts(counts: dict) -> None:
 def extract(config: str = _CONFIG_OPT,
             fixture_dir: Optional[str] = typer.Option(
                 None, help="Serve host responses from a fixture directory "
-                           "instead of connecting to the LPAR")) -> None:
+                           "instead of connecting to the LPAR"),
+            scope: Optional[str] = typer.Option(
+                None, help="Extraction scope: full|targeted "
+                           "(default: config's extraction_scope)")) -> None:
     """Pull catalogs, cross-references, and source members into the raw store."""
     cfg = _load(config)
     con = _con(cfg)
+    from .config import EXTRACTION_SCOPES
+    resolved_scope = (scope or cfg.extraction_scope).lower()
+    if resolved_scope not in EXTRACTION_SCOPES:
+        raise typer.BadParameter(
+            f"--scope must be one of {EXTRACTION_SCOPES}, got '{resolved_scope}'")
     if fixture_dir:
         from .extract.connection import FixtureHostSession
         session = FixtureHostSession(fixture_dir=fixture_dir)
@@ -48,7 +56,7 @@ def extract(config: str = _CONFIG_OPT,
         from .extract.connection import open_session
         session = open_session(cfg.connection)
     try:
-        from .extract import catalog, hostinfo, source, xref
+        from .extract import catalog, hostinfo, source, targeted, xref
         dbmod.reset_layer(con, "raw")
         profile = hostinfo.probe(session)
         profile.save(con)
@@ -56,12 +64,16 @@ def extract(config: str = _CONFIG_OPT,
                    f"(IFS_READ={'yes' if profile.has_ifs_read else 'no'}, "
                    f"source strategy="
                    f"{source.resolve_strategy(cfg, profile)})")
-        typer.echo("catalog:")
-        _echo_counts(catalog.harvest(session, con, cfg, profile))
-        typer.echo("xref:")
-        _echo_counts(xref.harvest(session, con, cfg))
-        typer.echo("source:")
-        _echo_counts(source.harvest(session, con, cfg, profile))
+        typer.echo(f"scope: {resolved_scope}")
+        if resolved_scope == "targeted":
+            _echo_counts(targeted.harvest_targeted(session, con, cfg, profile))
+        else:
+            typer.echo("catalog:")
+            _echo_counts(catalog.harvest(session, con, cfg, profile))
+            typer.echo("xref:")
+            _echo_counts(xref.harvest(session, con, cfg))
+            typer.echo("source:")
+            _echo_counts(source.harvest(session, con, cfg, profile))
         if not source.verify_roundtrip(con):
             typer.secho(
                 "WARNING: no non-blank source lines retrieved — possible "
@@ -263,9 +275,12 @@ def report(config: str = _CONFIG_OPT,
 @app.command()
 def run(config: str = _CONFIG_OPT,
         fixture_dir: Optional[str] = typer.Option(None),
-        phase: int = typer.Option(3)) -> None:
+        phase: int = typer.Option(3),
+        scope: Optional[str] = typer.Option(
+            None, help="Extraction scope: full|targeted "
+                       "(default: config's extraction_scope)")) -> None:
     """extract → parse → build → analyze → report, end to end."""
-    extract(config=config, fixture_dir=fixture_dir)
+    extract(config=config, fixture_dir=fixture_dir, scope=scope)
     parse(config=config)
     build(config=config, phase=phase)
     analyze(config=config)

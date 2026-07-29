@@ -260,6 +260,16 @@ def extracted(con, session, config):
 
 
 @pytest.fixture()
+def targeted_extracted(con, session, config):
+    """DuckDB store populated via targeted (slice-scoped) extraction."""
+    from lineage.extract import hostinfo, targeted
+    profile = hostinfo.probe(session)
+    profile.save(con)
+    targeted.harvest_targeted(session, con, config, profile)
+    return con
+
+
+@pytest.fixture()
 def parsed(extracted):
     """Raw + parsed layers populated."""
     from lineage.parse import cl, classify, dds, embedded_sql, rpg

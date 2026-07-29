@@ -67,6 +67,15 @@ Rules that must hold:
   aggregates — `COUNT`/`SUM`/`GROUP BY` over `QSYS2.OBJECT_STATISTICS` and
   catalog views only. Keep it free of `run_cl` and DDL; it runs ahead of
   `extract` to size the estate, not to change anything on the host.
+- `extraction_scope: targeted` (`extract/targeted.py`, `lineage extract
+  --scope targeted`) must only ever *narrow* what full mode would pull —
+  never issue a host command or SELECT that full mode wouldn't. It computes
+  the backward slice of the configured `output_seeds` (plus their
+  transitive callers) and iterates scoped catalog/xref/source pulls to
+  closure; every object it pulls is recorded in `slice_objects` (kind,
+  library, name, round, reason) as the auditable record of why. `full`
+  remains the default; `xref.harvest`/`catalog.harvest` full-mode behavior
+  must stay byte-identical to before targeted mode existed.
 
 ## Lineage semantics
 

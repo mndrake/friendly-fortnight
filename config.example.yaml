@@ -38,6 +38,24 @@ scratch_lib: QTEMP
 #                    for every member. Use on older releases.
 source_retrieval: auto
 
+# How much of the estate `lineage extract` pulls from the host:
+#   full     (default) - pull every configured library/source file in full:
+#                        DSPPGMREF/DSPFFD/DSPDBR *ALL, unscoped SYSCOLUMNS/
+#                        SYSPARTITIONSTAT, every source member. Simple and
+#                        safe; fine for small-to-medium estates.
+#   targeted           - iteratively pull only the backward slice of the
+#                        configured output_seeds (plus their transitive
+#                        callers) to closure, recorded in the slice_objects
+#                        table. Recommended for large estates: on one real
+#                        estate a full pull measured SYSCOLUMNS ~893k rows,
+#                        SYSPARTITIONSTAT a ~64s full scan, and ~16k source
+#                        members across the configured source files —
+#                        targeted extraction scopes all three to the slice.
+#                        DSPPGMREF *ALL per library remains the one broad
+#                        pull either way (it's how writers are found).
+#                        Override per run with `lineage extract --scope`.
+extraction_scope: full
+
 # Libraries to scan for objects and source. Order is significant only for reporting.
 libraries:
   - APPLIB

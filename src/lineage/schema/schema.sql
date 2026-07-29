@@ -101,6 +101,17 @@ CREATE TABLE IF NOT EXISTS raw_source_members (
     line_text      VARCHAR    -- SRCDTA
 );
 
+CREATE TABLE IF NOT EXISTS slice_objects (
+    -- Targeted extraction only (extraction_scope=targeted): every object
+    -- pulled into the slice, and why. Auditable record of what a targeted
+    -- run downloaded and which round/mechanism added it.
+    kind           VARCHAR,   -- program | file | member
+    library        VARCHAR,
+    name           VARCHAR,
+    round          INTEGER,   -- 0 = seed/backward-walk/caller, 1..5 = iterative rounds
+    reason         VARCHAR    -- seed / backward_walk / caller / dspdbr_based_on / ...
+);
+
 -- =========================================================================
 -- Parsed layer: interpreted source. Every row is derivable from raw + parser.
 -- =========================================================================

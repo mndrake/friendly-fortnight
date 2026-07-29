@@ -177,57 +177,142 @@ def _to_int(v: Any) -> int | None:
 
 # --- Orchestration (host-touching) ------------------------------------------
 
-def harvest(session: HostSession, con, config, scratch_lib: str | None = None) -> dict[str, int]:
-    """Run DSP* commands per library, load outfiles into the raw store.
+PGMREF_COLUMNS = ["program_lib", "program_name", "object_lib", "object_name",
+                  "object_type", "usage_flag", "ref_count"]
+FFD_COLUMNS = ["file_lib", "file_name", "record_format", "field_name",
+               "field_type", "field_length", "field_scale", "field_text",
+               "field_ordinal"]
+DBR_COLUMNS = ["dep_lib", "dep_file", "based_lib", "based_file", "dep_type"]
 
-    Returns a dict of raw table -> rows inserted. This is the only function
-    here that issues host commands; everything else is pure.
-    """
+
+def harvest_pgmref(session: HostSession, con, config,
+                   scratch_lib: str | None = None) -> dict[str, int]:
+    """DSPPGMREF PGM(lib/*ALL) per configured library — full-scope, always."""
     from ..db import insert_rows
 
     scratch = scratch_lib or config.scratch_lib
-    counts = {"raw_dsppgmref": 0, "raw_dspdbr": 0, "raw_dspffd": 0}
-
+    counts = {"raw_dsppgmref": 0}
     for lib in config.libraries:
-        # DSPPGMREF for all programs in the library.
         pgm_of = f"{scratch}/PGMREF"
         session.run_cl(
             f"DSPPGMREF PGM({lib}/*ALL) OUTPUT(*OUTFILE) OUTFILE({pgm_of})"
         )
         res = _select_outfile(session, scratch, "PGMREF", PGMREF_LAYOUT)
         counts["raw_dsppgmref"] += insert_rows(
-            con, "raw_dsppgmref",
-            ["program_lib", "program_name", "object_lib", "object_name",
-             "object_type", "usage_flag", "ref_count"],
-            map_pgmref(res),
-        )
+            con, "raw_dsppgmref", PGMREF_COLUMNS, map_pgmref(res))
+    return counts
 
-        # DSPFFD for all files in the library.
+
+def harvest_ffd(session: HostSession, con, config,
+                files: "Sequence[tuple[str, str]] | None" = None,
+                scratch_lib: str | None = None) -> dict[str, int]:
+    """DSPFFD outfile harvest.
+
+    ``files=None`` (default) reproduces today's behavior: one
+    ``DSPFFD FILE(lib/*ALL)`` per configured library. A ``files`` iterable of
+    ``(library, file)`` pairs instead issues one ``DSPFFD FILE(lib/file)`` per
+    pair — used by targeted extraction to scope the pull to a slice.
+
+    Per-file mode filters the mapped rows down to the requested (library,
+    file) before insert: the real host's outfile only contains that one file,
+    but :class:`FixtureHostSession` serves the same canned response for every
+    select, so without filtering this would insert duplicates. Pairs whose
+    (library, file) already have rows in ``raw_dspffd`` are skipped, so
+    repeat calls across rounds don't duplicate either.
+    """
+    from ..db import insert_rows
+
+    scratch = scratch_lib or config.scratch_lib
+    counts = {"raw_dspffd": 0}
+    if files is None:
+        for lib in config.libraries:
+            ffd_of = f"{scratch}/FFD"
+            session.run_cl(
+                f"DSPFFD FILE({lib}/*ALL) OUTPUT(*OUTFILE) OUTFILE({ffd_of})"
+            )
+            res = _select_outfile(session, scratch, "FFD", FFD_LAYOUT)
+            counts["raw_dspffd"] += insert_rows(
+                con, "raw_dspffd", FFD_COLUMNS, map_ffd(res))
+        return counts
+
+    already = _harvested_pairs(con, "raw_dspffd", "file_lib", "file_name")
+    for lib, file in files:
+        key = (lib.upper(), file.upper())
+        if key in already:
+            continue
         ffd_of = f"{scratch}/FFD"
         session.run_cl(
-            f"DSPFFD FILE({lib}/*ALL) OUTPUT(*OUTFILE) OUTFILE({ffd_of})"
+            f"DSPFFD FILE({lib}/{file}) OUTPUT(*OUTFILE) OUTFILE({ffd_of})"
         )
         res = _select_outfile(session, scratch, "FFD", FFD_LAYOUT)
-        counts["raw_dspffd"] += insert_rows(
-            con, "raw_dspffd",
-            ["file_lib", "file_name", "record_format", "field_name",
-             "field_type", "field_length", "field_scale", "field_text",
-             "field_ordinal"],
-            map_ffd(res),
-        )
+        rows = [r for r in map_ffd(res)
+                if ((r[0] or "").upper(), (r[1] or "").upper()) == key]
+        counts["raw_dspffd"] += insert_rows(con, "raw_dspffd", FFD_COLUMNS, rows)
+        already.add(key)
+    return counts
 
-        # DSPDBR for all files in the library (dependent relations).
+
+def harvest_dbr(session: HostSession, con, config,
+                files: "Sequence[tuple[str, str]] | None" = None,
+                scratch_lib: str | None = None) -> dict[str, int]:
+    """DSPDBR outfile harvest — dependent (logical) -> based-on (physical).
+
+    Same ``files=None`` vs. per-file scoping and dedup/filter rules as
+    :func:`harvest_ffd`, filtered on the *dependent* (library, file).
+    """
+    from ..db import insert_rows
+
+    scratch = scratch_lib or config.scratch_lib
+    counts = {"raw_dspdbr": 0}
+    if files is None:
+        for lib in config.libraries:
+            dbr_of = f"{scratch}/DBR"
+            session.run_cl(
+                f"DSPDBR FILE({lib}/*ALL) OUTPUT(*OUTFILE) OUTFILE({dbr_of})"
+            )
+            res = _select_outfile(session, scratch, "DBR", DBR_LAYOUT)
+            counts["raw_dspdbr"] += insert_rows(
+                con, "raw_dspdbr", DBR_COLUMNS, map_dbr(res))
+        return counts
+
+    already = _harvested_pairs(con, "raw_dspdbr", "dep_lib", "dep_file")
+    for lib, file in files:
+        key = (lib.upper(), file.upper())
+        if key in already:
+            continue
         dbr_of = f"{scratch}/DBR"
         session.run_cl(
-            f"DSPDBR FILE({lib}/*ALL) OUTPUT(*OUTFILE) OUTFILE({dbr_of})"
+            f"DSPDBR FILE({lib}/{file}) OUTPUT(*OUTFILE) OUTFILE({dbr_of})"
         )
         res = _select_outfile(session, scratch, "DBR", DBR_LAYOUT)
-        counts["raw_dspdbr"] += insert_rows(
-            con, "raw_dspdbr",
-            ["dep_lib", "dep_file", "based_lib", "based_file", "dep_type"],
-            map_dbr(res),
-        )
+        rows = [r for r in map_dbr(res)
+                if ((r[0] or "").upper(), (r[1] or "").upper()) == key]
+        counts["raw_dspdbr"] += insert_rows(con, "raw_dspdbr", DBR_COLUMNS, rows)
+        already.add(key)
+    return counts
 
+
+def _harvested_pairs(con, table: str, lib_col: str, name_col: str
+                     ) -> set[tuple[str, str]]:
+    rows = con.execute(
+        f"SELECT DISTINCT {lib_col}, {name_col} FROM {table}").fetchall()
+    return {((lib or "").upper(), (name or "").upper()) for lib, name in rows}
+
+
+def harvest(session: HostSession, con, config, scratch_lib: str | None = None) -> dict[str, int]:
+    """Full-mode wrapper: DSPPGMREF/DSPFFD/DSPDBR *ALL per configured library.
+
+    Returns a dict of raw table -> rows inserted. This (and the three
+    per-command functions above) are the only functions here that issue host
+    commands; everything else is pure. Existing callers/tests target this
+    full-mode entry point unchanged; targeted extraction
+    (:mod:`lineage.extract.targeted`) calls the three sub-functions directly
+    with a ``files`` scope.
+    """
+    counts: dict[str, int] = {}
+    counts.update(harvest_pgmref(session, con, config, scratch_lib=scratch_lib))
+    counts.update(harvest_ffd(session, con, config, scratch_lib=scratch_lib))
+    counts.update(harvest_dbr(session, con, config, scratch_lib=scratch_lib))
     return counts
 
 

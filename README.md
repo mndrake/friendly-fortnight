@@ -74,7 +74,18 @@ For live-host extraction include the `host` extra (jaydebeapi/JPype):
    and catalog-view aggregates only, no CL, no DDL) and writes
    `data/profile_report.json` with recommendations on whether targeted
    extraction is needed before scoping a full pull.
-4. Run the stages (each is re-runnable):
+4. On a large estate, set `extraction_scope: targeted` in `config.yaml` (or
+   pass `lineage extract --scope targeted`) once the profile confirms the
+   output seeds are DDL-only. Targeted extraction still runs `DSPPGMREF
+   *ALL` per library (the one broad pull — it's how writers are found), but
+   then iterates to closure over just the backward slice of the configured
+   `output_seeds` plus their transitive callers: scoped SYSCOLUMNS/
+   SYSPARTITIONSTAT, per-file DSPFFD/DSPDBR, and only the source members
+   that slice actually needs (capped at 5 rounds). Every object pulled is
+   recorded in the `slice_objects` table with the round and reason it
+   entered the slice, so a targeted run is auditable. `extraction_scope:
+   full` (the default) is unaffected either way.
+5. Run the stages (each is re-runnable):
 
 ```sh
 uv run lineage extract          # catalogs, DSPPGMREF/DSPDBR/DSPFFD, source members

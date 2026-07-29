@@ -72,6 +72,17 @@ class StorageConfig:
 #   older releases; creates a temporary object per member read.
 SOURCE_RETRIEVAL_MODES = ("auto", "ifs_read", "alias")
 
+# How much of the estate ``lineage extract`` pulls from the host:
+# - "full" (default): today's behavior — every configured library/source
+#   file is pulled in full (DSPPGMREF/DSPFFD/DSPDBR *ALL, unscoped
+#   SYSCOLUMNS/SYSPARTITIONSTAT, every source member).
+# - "targeted": iteratively pulls only the backward slice of the configured
+#   output seeds (plus their transitive callers) to closure — see
+#   ``lineage.extract.targeted``. Recommended for large estates where a full
+#   pull is prohibitively slow (measured on a real estate: SYSCOLUMNS ~893k
+#   rows, SYSPARTITIONSTAT full scan ~64s, ~16k source members).
+EXTRACTION_SCOPES = ("full", "targeted")
+
 
 @dataclass(frozen=True)
 class Config:
@@ -83,6 +94,7 @@ class Config:
     liblists: dict[str, tuple[str, ...]]
     storage: StorageConfig
     source_retrieval: str = "auto"
+    extraction_scope: str = "full"
     root: Path = Path(".")
 
     def liblist(self, name: str | None) -> tuple[str, ...]:
@@ -183,6 +195,12 @@ def from_dict(raw: dict[str, Any], root: Path = Path(".")) -> Config:
             f"source_retrieval must be one of {SOURCE_RETRIEVAL_MODES}, "
             f"got '{source_retrieval}'")
 
+    extraction_scope = str(raw.get("extraction_scope", "full")).lower()
+    if extraction_scope not in EXTRACTION_SCOPES:
+        raise ConfigError(
+            f"extraction_scope must be one of {EXTRACTION_SCOPES}, "
+            f"got '{extraction_scope}'")
+
     return Config(
         connection=connection,
         scratch_lib=str(scratch_lib),
@@ -192,5 +210,6 @@ def from_dict(raw: dict[str, Any], root: Path = Path(".")) -> Config:
         liblists=liblists,
         storage=storage,
         source_retrieval=source_retrieval,
+        extraction_scope=extraction_scope,
         root=root,
     )

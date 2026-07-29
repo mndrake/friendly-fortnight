@@ -43,12 +43,15 @@ class PullSpec:
     schema_filter: str             # column filtering by library
     cols: tuple[ColSpec, ...]
 
-    def build_select(self, available: set[str], libs_in: str
+    def build_select(self, available: set[str], libs_in: str,
+                     extra_where: Optional[str] = None
                      ) -> tuple[str, list[str]]:
         """Return (sql, missing_optional_raw_columns).
 
         Raises ``CatalogShapeError`` when a required column has no available
-        candidate.
+        candidate. ``extra_where``, when given, is AND-ed onto the WHERE
+        clause (used to scope a pull to a chunked list of (schema, name)
+        pairs — see :func:`pairs_filter`).
         """
         parts: list[str] = []
         missing: list[str] = []
@@ -63,6 +66,8 @@ class PullSpec:
                 parts.append(f"{picked} AS {col.raw}")
         sql = (f"SELECT {', '.join(parts)} FROM QSYS2.{self.catalog_view} "
                f"WHERE {self.schema_filter} IN ({libs_in})")
+        if extra_where:
+            sql += f" AND ({extra_where})"
         return sql, missing
 
 
@@ -171,6 +176,35 @@ def _in_list(libs: Sequence[str]) -> str:
     return ", ".join("'" + lib.replace("'", "''") + "'" for lib in libs)
 
 
+def _quote(v: str) -> str:
+    return "'" + v.replace("'", "''") + "'"
+
+
+def pairs_filter(schema_col: str, name_col: str,
+                 pairs: Sequence[tuple[str, str]], chunk: int = 500
+                 ) -> list[str]:
+    """Chunk ``(schema, name)`` pairs into ``OR``-of-``AND`` WHERE fragments.
+
+    Each fragment looks like::
+
+        ((SCHEMA_COL = 'LIB1' AND NAME_COL = 'NAME1') OR
+         (SCHEMA_COL = 'LIB2' AND NAME_COL = 'NAME2') OR ...)
+
+    Returns one fragment per ``chunk``-sized slice of ``pairs`` (so a caller
+    issues one SELECT per fragment and concatenates the rows) — keeps any
+    single ``IN``/``OR`` list from growing unbounded against large slices.
+    """
+    fragments: list[str] = []
+    pairs = list(pairs)
+    for i in range(0, len(pairs), chunk):
+        batch = pairs[i:i + chunk]
+        ors = " OR ".join(
+            f"({schema_col} = {_quote(lib)} AND {name_col} = {_quote(name)})"
+            for lib, name in batch)
+        fragments.append(f"({ors})")
+    return fragments
+
+
 def _fetch(session: HostSession, tag: str, sql: str) -> QueryResult:
     if hasattr(session, "with_tag"):
         return session.with_tag(tag).query(sql)
@@ -178,11 +212,40 @@ def _fetch(session: HostSession, tag: str, sql: str) -> QueryResult:
 
 
 def harvest(session: HostSession, con, config,
-            profile: HostProfile | None = None) -> dict[str, int]:
+            profile: HostProfile | None = None,
+            only: dict[str, Sequence[tuple[str, str]]] | None = None
+            ) -> dict[str, int]:
+    """Pull the QSYS2 catalog views into the raw store.
+
+    ``only``, when given, maps a ``catalog_view`` name (e.g. ``"SYSCOLUMNS"``)
+    to a list of ``(library, name)`` pairs that pull is scoped to — used by
+    targeted extraction to avoid a full-library SYSCOLUMNS/SYSPARTITIONSTAT
+    scan. A view named in ``only`` with an *empty* list is skipped entirely
+    (0 rows) rather than issuing an unfiltered pull; views not named in
+    ``only`` behave exactly as a full-mode pull (today's behavior).
+    """
     libs = _in_list(config.libraries)
     counts: dict[str, int] = {}
     for spec in PULLS:
+        pairs: Optional[Sequence[tuple[str, str]]] = None
+        if only is not None and spec.catalog_view in only:
+            pairs = only[spec.catalog_view]
+            if not pairs:
+                counts[spec.raw_table] = 0
+                continue
         available = profile.columns_of(spec.catalog_view) if profile else set()
+        if pairs is not None:
+            rows: list[tuple] = []
+            missing: list[str] = []
+            for frag in pairs_filter(spec.schema_filter, "TABLE_NAME", pairs):
+                sql, missing = spec.build_select(available, libs, extra_where=frag)
+                res = _fetch(session, f"catalog.{spec.name}", sql)
+                rows.extend(tuple(r) for r in res.rows)
+            if missing:
+                counts[f"{spec.name}_missing_columns"] = len(missing)
+            counts[spec.raw_table] = insert_rows(
+                con, spec.raw_table, RAW_COLUMNS[spec.raw_table], rows)
+            continue
         sql, missing = spec.build_select(available, libs)
         if missing:
             counts[f"{spec.name}_missing_columns"] = len(missing)
