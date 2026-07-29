@@ -69,7 +69,11 @@ For live-host extraction include the `host` extra (jaydebeapi/JPype):
    required column fails with an explicit message instead of a generic
    column-not-found error. `uv run python scripts/smoke_host.py config.yaml`
    additionally checks QCMDEXC, the DSPPGMREF outfile column layout, and a
-   source-member CCSID round-trip.
+   source-member CCSID round-trip. `uv run lineage profile` measures
+   catalog/source volumes and bottlenecks read-only (`QSYS2.OBJECT_STATISTICS`
+   and catalog-view aggregates only, no CL, no DDL) and writes
+   `data/profile_report.json` with recommendations on whether targeted
+   extraction is needed before scoping a full pull.
 4. Run the stages (each is re-runnable):
 
 ```sh

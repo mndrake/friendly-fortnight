@@ -72,6 +72,76 @@ def extract(config: str = _CONFIG_OPT,
 
 
 @app.command()
+def profile(config: str = _CONFIG_OPT,
+           fixture_dir: Optional[str] = typer.Option(
+               None, help="Serve host responses from a fixture directory "
+                          "instead of connecting to the LPAR"),
+           out: str = typer.Option("data/profile_report.json",
+                                   help="Where to write the JSON report")
+           ) -> None:
+    """Measure catalog/source volumes read-only, ahead of a full extract."""
+    cfg = _load(config)
+    if fixture_dir:
+        from .extract.connection import FixtureHostSession
+        session = FixtureHostSession(fixture_dir=fixture_dir)
+    else:
+        from .extract.connection import open_session
+        session = open_session(cfg.connection)
+    try:
+        from .extract.profiler import profile_host, recommend
+        report = profile_host(session, cfg)
+
+        typer.echo("library objects:")
+        for lib, by_type in sorted(report.library_objects.items()):
+            for otype, counts in sorted(by_type.items()):
+                total = sum(counts.values())
+                typer.echo(f"  {lib} {otype}: {total} "
+                           f"({', '.join(f'{k}={v}' for k, v in sorted(counts.items()))})")
+
+        typer.echo("catalog rows:")
+        for view, count in sorted(report.catalog_rows.items()):
+            typer.echo(f"  {view}: {count}")
+
+        typer.echo("source volumes:")
+        for key, vol in sorted(report.source_volumes.items()):
+            typer.echo(f"  {key}: {vol['members']} members, "
+                       f"{vol['total_lines']} lines, "
+                       f"{vol['total_bytes']} bytes")
+
+        typer.echo("output seeds:")
+        for seed_id, info in sorted(report.seed_classes.items()):
+            line = (f"  {seed_id}: {info['library']}/{info['file']} -> "
+                   f"{info['classification']}")
+            if info["classification"] != "ddl_table":
+                typer.secho(line, fg=typer.colors.YELLOW)
+            else:
+                typer.echo(line)
+
+        slow = sorted(report.timings.items(), key=lambda kv: kv[1],
+                     reverse=True)[:5]
+        if slow:
+            typer.echo("slowest probes:")
+            for tag, secs in slow:
+                typer.echo(f"  {tag}: {secs:.2f}s")
+
+        if report.errors:
+            typer.secho("probe errors:", fg=typer.colors.YELLOW)
+            for tag, msg in sorted(report.errors.items()):
+                typer.secho(f"  {tag}: {msg}", fg=typer.colors.YELLOW)
+
+        typer.echo("recommendations:")
+        for line in recommend(report, cfg):
+            typer.echo(f"- {line}")
+
+        out_path = Path(out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(report.to_json(), encoding="utf-8")
+        typer.echo(f"report written to {out_path}")
+    finally:
+        session.close()
+
+
+@app.command()
 def probe(config: str = _CONFIG_OPT) -> None:
     """Detect the host's DB2/OS version and catalog capabilities."""
     cfg = _load(config)

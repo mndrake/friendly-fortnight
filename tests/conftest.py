@@ -179,6 +179,49 @@ def build_session() -> FixtureHostSession:
               for t, cols in _FFD.items() for i, c in enumerate(cols)],
     )
 
+    # Profiling probes (lineage.extract.profiler) — read-only aggregates.
+    responses["profile.objects.APPLIB.pgm"] = QueryResult(
+        columns=["OBJATTRIBUTE", "COUNT"],
+        rows=[("CLP", 2), ("RPG", 3), ("SQLRPG", 1)])
+    responses["profile.objects.APPLIB.file"] = QueryResult(
+        columns=["OBJATTRIBUTE", "COUNT"], rows=[("PF", 8), ("LF", 1)])
+
+    responses["profile.catalog.systables"] = QueryResult(
+        columns=["CNT"], rows=[(9,)])
+    responses["profile.catalog.syscolumns"] = QueryResult(
+        columns=["CNT"], rows=[(24,)])
+    responses["profile.catalog.sysviews"] = QueryResult(
+        columns=["CNT"], rows=[(1,)])
+    responses["profile.catalog.sysviewdep"] = QueryResult(
+        columns=["CNT"], rows=[(1,)])
+    responses["profile.catalog.syspartitionstat"] = QueryResult(
+        columns=["CNT"], rows=[(16,)])
+
+    _SOURCE_VOLUMES = {
+        "QCLSRC": (2, 19, 2000),
+        "QRPGSRC": (4, 40, 4000),
+        "QDDSSRC": (7, 40, 4000),
+    }
+    _SOURCE_TOP = {
+        "QCLSRC": [("CLDRIVER", 12), ("CLDYN", 7)],
+        "QRPGSRC": [("RPT001", 14), ("RPT002", 12), ("PGMDESC", 8),
+                    ("SQLEXT", 6)],
+        "QDDSSRC": [("CUSTMAST", 10), ("ORDERS", 9), ("CUSTLF1", 6)],
+    }
+    for srcfile, (cnt, lines, size) in _SOURCE_VOLUMES.items():
+        responses[f"profile.source.{LIB}.{srcfile}"] = QueryResult(
+            columns=["CNT", "LINES", "BYTES"], rows=[(cnt, lines, size)])
+        responses[f"profile.source.{LIB}.{srcfile}.top"] = QueryResult(
+            columns=["TABLE_PARTITION", "NUMBER_ROWS"],
+            rows=_SOURCE_TOP[srcfile])
+
+    for seed_id in ("CUST_MONTHLY_RPT", "ORDER_EXTRACT", "ORDER_SUMMARY"):
+        responses[f"profile.seed.{seed_id}"] = QueryResult(
+            columns=["OBJATTRIBUTE", "SQL_OBJECT_TYPE"],
+            rows=[("PF", "TABLE")])
+    responses["profile.seed.MISSING_OUT"] = QueryResult(
+        columns=["OBJATTRIBUTE", "SQL_OBJECT_TYPE"], rows=[])
+
     for srcfile in {"QCLSRC", "QRPGSRC", "QDDSSRC"}:
         members = [(m, t) for sf, m, t in _source_members() if sf == srcfile]
         responses[f"source.members.{LIB}.{srcfile}"] = QueryResult(

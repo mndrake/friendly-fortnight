@@ -63,6 +63,10 @@ Rules that must hold:
   add it as a candidate list, not a bare name (e.g. member name is
   `TABLE_PARTITION`, view deps use `OBJECT_SCHEMA`/`OBJECT_NAME`, SYSTABLES
   has no row-count column).
+- Profiling (`extract/profiler.py`, `lineage profile`) is strictly read-only
+  aggregates — `COUNT`/`SUM`/`GROUP BY` over `QSYS2.OBJECT_STATISTICS` and
+  catalog views only. Keep it free of `run_cl` and DDL; it runs ahead of
+  `extract` to size the estate, not to change anything on the host.
 
 ## Lineage semantics
 
