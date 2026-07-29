@@ -83,6 +83,20 @@ SOURCE_RETRIEVAL_MODES = ("auto", "ifs_read", "alias")
 #   rows, SYSPARTITIONSTAT full scan ~64s, ~16k source members).
 EXTRACTION_SCOPES = ("full", "targeted")
 
+# How targeted extraction handles slice objects found in libraries outside
+# the configured `libraries` scan list (discovered via CPYF/OVRDBF targets,
+# qualified source references, or an objstat-discovered source location):
+# - "slice" (default): per-file pulls (DSPFFD/DSPDBR, scoped catalog
+#   SELECTs) follow the slice into those libraries too — `source_files`
+#   itself becomes optional, since targeted mode discovers each object's
+#   source location directly (``extract/objinfo.py``).
+# - "none": restores the strictly-configured behavior — slice objects
+#   outside `config.libraries` are still recorded in `slice_objects` (audit
+#   trail) but never pulled.
+# Broad `*ALL` commands (DSPPGMREF) never leave `config.libraries` in either
+# mode.
+LIBRARY_DISCOVERY_MODES = ("slice", "none")
+
 
 @dataclass(frozen=True)
 class Config:
@@ -95,6 +109,7 @@ class Config:
     storage: StorageConfig
     source_retrieval: str = "auto"
     extraction_scope: str = "full"
+    library_discovery: str = "slice"
     root: Path = Path(".")
 
     def liblist(self, name: str | None) -> tuple[str, ...]:
@@ -201,6 +216,12 @@ def from_dict(raw: dict[str, Any], root: Path = Path(".")) -> Config:
             f"extraction_scope must be one of {EXTRACTION_SCOPES}, "
             f"got '{extraction_scope}'")
 
+    library_discovery = str(raw.get("library_discovery", "slice")).lower()
+    if library_discovery not in LIBRARY_DISCOVERY_MODES:
+        raise ConfigError(
+            f"library_discovery must be one of {LIBRARY_DISCOVERY_MODES}, "
+            f"got '{library_discovery}'")
+
     return Config(
         connection=connection,
         scratch_lib=str(scratch_lib),
@@ -211,5 +232,6 @@ def from_dict(raw: dict[str, Any], root: Path = Path(".")) -> Config:
         storage=storage,
         source_retrieval=source_retrieval,
         extraction_scope=extraction_scope,
+        library_discovery=library_discovery,
         root=root,
     )

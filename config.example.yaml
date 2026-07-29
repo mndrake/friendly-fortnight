@@ -56,12 +56,28 @@ source_retrieval: auto
 #                        Override per run with `lineage extract --scope`.
 extraction_scope: full
 
+# Targeted mode only: how slice objects found in libraries *outside*
+# `libraries` below (via CPYF/OVRDBF targets, qualified source references,
+# or an objstat-discovered source location) are handled:
+#   slice (default) - per-file pulls (DSPFFD/DSPDBR, scoped catalog
+#                     SELECTs) follow the slice into those libraries too.
+#   none            - restores the strictly-configured behavior: such
+#                     objects are recorded in slice_objects (audit trail)
+#                     but never pulled.
+# Broad *ALL commands (DSPPGMREF) never leave `libraries` either way.
+library_discovery: slice
+
 # Libraries to scan for objects and source. Order is significant only for reporting.
 libraries:
   - APPLIB
   - APPLIBSRC
 
-# Source physical files (library/file) to enumerate and retrieve members from.
+# Source physical files (library/file) to enumerate and retrieve members
+# from. Required for `extraction_scope: full`. Optional for `targeted` mode:
+# targeted extraction discovers each slice object's actual source location
+# per object (QSYS2.OBJECT_STATISTICS) and only falls back to matching
+# against these when discovery misses — list them anyway if known, since the
+# fallback also covers `/COPY` and `RUNSQLSTM` members.
 source_files:
   - library: APPLIBSRC
     file: QCLSRC

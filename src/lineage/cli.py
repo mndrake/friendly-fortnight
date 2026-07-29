@@ -49,6 +49,10 @@ def extract(config: str = _CONFIG_OPT,
     if resolved_scope not in EXTRACTION_SCOPES:
         raise typer.BadParameter(
             f"--scope must be one of {EXTRACTION_SCOPES}, got '{resolved_scope}'")
+    if resolved_scope == "full" and not cfg.source_files:
+        raise typer.BadParameter(
+            "full extraction requires source_files; targeted mode can "
+            "discover them")
     if fixture_dir:
         from .extract.connection import FixtureHostSession
         session = FixtureHostSession(fixture_dir=fixture_dir)

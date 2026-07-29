@@ -179,6 +179,33 @@ def build_session() -> FixtureHostSession:
               for t, cols in _FFD.items() for i, c in enumerate(cols)],
     )
 
+    # objstat (QSYS2.OBJECT_STATISTICS) source-location responses: where
+    # targeted extraction's discovery pass finds each object's source. Member
+    # name == object name for this estate (so raw_source_members content is
+    # identical whether an object is fetched via discovery or the
+    # name-matching fallback); PGMDESC/GHOST are never sliced, kept only for
+    # fixture faithfulness.
+    _OBJSTAT_COLS = ["SOURCE_LIBRARY", "SOURCE_FILE", "SOURCE_MEMBER"]
+    _OBJSTAT_PGM_SRCFILE = {
+        "RPT001": "QRPGSRC", "RPT002": "QRPGSRC", "SQLEXT": "QRPGSRC",
+        "PGMDESC": "QRPGSRC", "CLDRIVER": "QCLSRC", "CLDYN": "QCLSRC",
+    }
+    for pgm, srcfile in _OBJSTAT_PGM_SRCFILE.items():
+        responses[f"objstat.{LIB}.{pgm}.pgm"] = QueryResult(
+            columns=_OBJSTAT_COLS, rows=[(LIB, srcfile, pgm)])
+    for pgm in ("GHOST",):
+        responses[f"objstat.{LIB}.{pgm}.pgm"] = QueryResult(
+            columns=_OBJSTAT_COLS, rows=[])
+
+    _OBJSTAT_FILE_HIT = ["CUSTMAST", "ORDERS", "ORDHIST", "CUSTRPT", "ORDEXT",
+                        "ORDSUM", "CUSTLF1"]
+    for f in _OBJSTAT_FILE_HIT:
+        responses[f"objstat.{LIB}.{f}.file"] = QueryResult(
+            columns=_OBJSTAT_COLS, rows=[(LIB, "QDDSSRC", f)])
+    for f in ("ORDARC", "CUSTVIEW", "NOWHERE"):
+        responses[f"objstat.{LIB}.{f}.file"] = QueryResult(
+            columns=_OBJSTAT_COLS, rows=[])
+
     # Profiling probes (lineage.extract.profiler) — read-only aggregates.
     responses["profile.objects.APPLIB.pgm"] = QueryResult(
         columns=["OBJATTRIBUTE", "COUNT"],

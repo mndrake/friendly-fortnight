@@ -207,12 +207,7 @@ def test_slice_placeholder_upgrade_reports_change():
 
 # --- Targeted mode never touches unconfigured libraries ------------------------
 
-def test_targeted_never_pulls_outside_configured_libraries():
-    """A CPYF referencing OTHERLIB (not in config.libraries) must not cause
-    DSPFFD/DSPDBR against OTHERLIB — full mode would never touch it either.
-    The file still enters the slice for the audit trail."""
-    from lineage.extract import targeted
-
+def _otherlib_responses() -> dict[str, QueryResult]:
     responses: dict[str, QueryResult] = {}
     for tag in ("catalog.systables", "catalog.sysviews", "catalog.sysviewdep",
                "catalog.syscolumns", "catalog.syspartitionstat"):
@@ -229,6 +224,13 @@ def test_targeted_never_pulls_outside_configured_libraries():
     responses["xref.dspdbr"] = QueryResult(
         columns=["dep_lib", "dep_file", "based_lib", "based_file", "dep_type"],
         rows=[])
+    # objstat: WRITER/OUT1/EXTFILE all resolve empty -- this estate relies
+    # purely on the name-matching fallback and CPYF discovery.
+    for tag in ("objstat.TESTLIB.WRITER.pgm", "objstat.TESTLIB.OUT1.file",
+               "objstat.OTHERLIB.EXTFILE.file"):
+        responses[tag] = QueryResult(
+            columns=["SOURCE_LIBRARY", "SOURCE_FILE", "SOURCE_MEMBER"],
+            rows=[])
     responses["source.members.TESTLIB.QCLSRC"] = QueryResult(
         columns=["member", "member_type"], rows=[("WRITER", "CLP")])
     responses["source.text.TESTLIB.QCLSRC.WRITER"] = QueryResult(
@@ -236,13 +238,44 @@ def test_targeted_never_pulls_outside_configured_libraries():
         rows=[(1, "PGM"),
               (2, "CPYF FROMFILE(OTHERLIB/EXTFILE) TOFILE(TESTLIB/OUT1)"),
               (3, "ENDPGM")])
-    session = FixtureHostSession(responses=responses)
+    return responses
+
+
+def test_targeted_never_pulls_outside_configured_libraries():
+    """With library_discovery: none, a CPYF referencing OTHERLIB (not in
+    config.libraries) must not cause DSPFFD/DSPDBR against OTHERLIB -- full
+    mode would never touch it either. The file still enters the slice for
+    the audit trail."""
+    from lineage.extract import targeted
+
+    session = FixtureHostSession(responses=_otherlib_responses())
     con = dbmod.connect(None)
-    counts = targeted.harvest_targeted(session, con, _synthetic_config())
+    counts = targeted.harvest_targeted(
+        session, con, _synthetic_config(library_discovery="none"))
 
     assert not any("OTHERLIB" in c for c in session.cl_log)
     sl = _slice_rows(con)
     assert ("file", "OTHERLIB", "EXTFILE") in sl   # audited, never pulled
+    con.close()
+
+
+def test_targeted_slice_discovery_pulls_otherlib_per_file():
+    """Default library_discovery: slice follows the slice into OTHERLIB with
+    per-file pulls only -- never a broad *ALL or DSPPGMREF for it."""
+    from lineage.extract import targeted
+
+    session = FixtureHostSession(responses=_otherlib_responses())
+    con = dbmod.connect(None)
+    counts = targeted.harvest_targeted(session, con, _synthetic_config())
+
+    assert any("DSPFFD FILE(OTHERLIB/EXTFILE)" in c for c in session.cl_log)
+    assert any("DSPDBR FILE(OTHERLIB/EXTFILE)" in c for c in session.cl_log)
+    assert not any("OTHERLIB/*ALL" in c for c in session.cl_log)
+    assert not any(c.startswith("DSPPGMREF") and "OTHERLIB" in c
+                  for c in session.cl_log)
+    sl = _slice_rows(con)
+    assert ("file", "OTHERLIB", "EXTFILE") in sl
+    assert counts["slice.libraries_discovered"] >= 1
     con.close()
 
 
@@ -272,12 +305,18 @@ def _cl_member(*lines: str) -> str:
     return "\n".join(lines)
 
 
-def _synthetic_session(chain: list[str]) -> FixtureHostSession:
+def _synthetic_session(chain: list[str],
+                       extra_responses: dict[str, QueryResult] | None = None
+                       ) -> FixtureHostSession:
     """A CL call chain WRITER -> P1 -> P2 -> ... ; WRITER writes OUT1 via a
     compiled xref reference (so it's the backward-walk seed writer); every
-    other hop in the chain is discoverable *only* by parsing CL source —
+    other hop in the chain is discoverable *only* by parsing CL source --
     exactly the "revealed by a fetched member" case targeted extraction must
-    iterate to reach.
+    iterate to reach. No objstat.* tags are seeded by default, so
+    objinfo.source_location() always misses (missing fixture tag -> caught
+    exception -> None) and every member is found via name-matching;
+    ``extra_responses`` lets a caller override/add specific tags (e.g. an
+    explicit empty objstat response) without needing to rebuild the estate.
     """
     responses: dict[str, QueryResult] = {}
     empty_cols = ["A"]
@@ -322,16 +361,18 @@ def _synthetic_session(chain: list[str]) -> FixtureHostSession:
             rows=[(i + 1, ln) for i, ln in enumerate(lines)],
         )
 
+    responses.update(extra_responses or {})
     return FixtureHostSession(responses=responses)
 
 
-def _synthetic_config():
+def _synthetic_config(library_discovery: str = "slice"):
     return from_dict({
         "scratch_lib": "QTEMP",
         "libraries": ["TESTLIB"],
         "source_files": [{"library": "TESTLIB", "file": "QCLSRC"}],
         "output_seeds": [{"id": "OUT", "library": "TESTLIB", "file": "OUT1"}],
         "liblists": {"default": ["TESTLIB"]},
+        "library_discovery": library_discovery,
     })
 
 
@@ -422,4 +463,102 @@ def test_cycle_does_not_loop_forever():
     programs = {name for kind, _, name in sl if kind == "program"}
     assert programs == {"A", "B"}
     assert counts["slice.rounds"] < targeted.MAX_ROUNDS
+    con.close()
+
+
+# --- objstat-driven discovery: member name != object name ---------------------
+
+def test_objstat_discovers_member_name_mismatch():
+    """WRITER's *recorded* source member is WRITERSRC, not WRITER -- objstat
+    discovery must fetch WRITERSRC even though plain name-matching (member
+    name == object name) would never find it."""
+    from lineage.extract import targeted
+
+    responses: dict[str, QueryResult] = {}
+    for tag in ("catalog.systables", "catalog.sysviews", "catalog.sysviewdep",
+               "catalog.syscolumns", "catalog.syspartitionstat"):
+        responses[tag] = QueryResult(columns=["a"], rows=[])
+    responses["xref.dsppgmref"] = QueryResult(
+        columns=["program_lib", "program_name", "object_lib", "object_name",
+                 "object_type", "usage_flag", "ref_count"],
+        rows=[("TESTLIB", "WRITER", "TESTLIB", "OUT1", "F", "2", 1)],
+    )
+    responses["xref.dspffd"] = QueryResult(
+        columns=["file_lib", "file_name", "record_format", "field_name",
+                 "field_type", "field_length", "field_scale", "field_text",
+                 "field_ordinal"], rows=[])
+    responses["xref.dspdbr"] = QueryResult(
+        columns=["dep_lib", "dep_file", "based_lib", "based_file", "dep_type"],
+        rows=[])
+    responses["objstat.TESTLIB.WRITER.pgm"] = QueryResult(
+        columns=["SOURCE_LIBRARY", "SOURCE_FILE", "SOURCE_MEMBER"],
+        rows=[("TESTLIB", "QCLSRC", "WRITERSRC")])
+    responses["objstat.TESTLIB.OUT1.file"] = QueryResult(
+        columns=["SOURCE_LIBRARY", "SOURCE_FILE", "SOURCE_MEMBER"], rows=[])
+    # Enumeration lists the *recorded* member name, WRITERSRC -- WRITER
+    # itself is never a member in this estate.
+    responses["source.members.TESTLIB.QCLSRC"] = QueryResult(
+        columns=["member", "member_type"], rows=[("WRITERSRC", "CLP")])
+    responses["source.text.TESTLIB.QCLSRC.WRITERSRC"] = QueryResult(
+        columns=["SRCSEQ", "SRCDTA"],
+        rows=[(1, "PGM"), (2, "CALL PGM(TESTLIB/HELPER)"), (3, "ENDPGM")])
+    session = FixtureHostSession(responses=responses)
+    con = dbmod.connect(None)
+    targeted.harvest_targeted(session, con, _synthetic_config())
+
+    rows = con.execute(
+        "SELECT library, srcfile, member FROM raw_source_members").fetchall()
+    assert ("TESTLIB", "QCLSRC", "WRITERSRC") in rows
+    assert not any(r[2] == "WRITER" for r in rows)
+    sl = _slice_rows(con)
+    assert ("program", "TESTLIB", "WRITER") in sl
+    src_ref = con.execute(
+        "SELECT source_ref FROM slice_objects WHERE kind='program' AND "
+        "name='WRITER'").fetchone()[0]
+    assert src_ref == "TESTLIB/QCLSRC(WRITERSRC)"
+    con.close()
+
+
+def test_objstat_empty_response_degrades_to_name_matching():
+    """objstat returning zero rows (not an exception) must still fall back
+    to plain name-matching for that object, with source_ref left NULL."""
+    from lineage.extract import targeted
+
+    empty_objstat = QueryResult(
+        columns=["SOURCE_LIBRARY", "SOURCE_FILE", "SOURCE_MEMBER"], rows=[])
+    session = _synthetic_session(["WRITER"], extra_responses={
+        "objstat.TESTLIB.WRITER.pgm": empty_objstat,
+        "objstat.TESTLIB.OUT1.file": empty_objstat,
+    })
+    con = dbmod.connect(None)
+    targeted.harvest_targeted(session, con, _synthetic_config())
+
+    members = {r[0] for r in con.execute(
+        "SELECT DISTINCT member FROM raw_source_members").fetchall()}
+    assert "WRITER" in members
+    src_ref = con.execute(
+        "SELECT source_ref FROM slice_objects WHERE kind='program' AND "
+        "name='WRITER'").fetchone()[0]
+    assert src_ref is None
+    con.close()
+
+
+# --- source_files becomes optional for targeted mode --------------------------
+
+def test_targeted_discovers_source_files_without_config(session, config):
+    """With no source_files configured at all, targeted extraction still
+    retrieves every slice member purely via objstat discovery."""
+    import dataclasses
+
+    from lineage.extract import hostinfo, targeted
+
+    cfg = dataclasses.replace(config, source_files=())
+    con = dbmod.connect(None)
+    profile = hostinfo.probe(session)
+    counts = targeted.harvest_targeted(session, con, cfg, profile)
+
+    assert counts["slice.source_files_discovered"] > 0
+    members = {r[0] for r in con.execute(
+        "SELECT DISTINCT member FROM raw_source_members").fetchall()}
+    assert {"RPT001", "RPT002", "SQLEXT", "CUSTMAST", "ORDERS"} <= members
     con.close()

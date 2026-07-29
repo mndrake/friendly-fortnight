@@ -48,7 +48,12 @@ Rules that must hold:
   the same fixture tag.
 - Libraries, output seeds, and library lists are **configuration, not
   discovery** (`config.yaml`, loaded by `lineage/config.py`). Never infer
-  them from the host.
+  them from the host. Source *locations* are the one exception: targeted
+  mode asks each slice program/file where its source actually lives
+  (`QSYS2.OBJECT_STATISTICS`, `extract/objinfo.py`) rather than assuming the
+  member name matches the object name, so `source_files` is optional for
+  targeted mode (still required, validated at `extract` time, for
+  `extraction_scope: full`).
 - Outfile record layouts (DSPPGMREF/DSPDBR/DSPFFD in `extract/xref.py`) are
   mapped **by field name, never by position**; a missing field must raise,
   not shift columns.
@@ -73,9 +78,17 @@ Rules that must hold:
   the backward slice of the configured `output_seeds` (plus their
   transitive callers) and iterates scoped catalog/xref/source pulls to
   closure; every object it pulls is recorded in `slice_objects` (kind,
-  library, name, round, reason) as the auditable record of why. `full`
-  remains the default; `xref.harvest`/`catalog.harvest` full-mode behavior
-  must stay byte-identical to before targeted mode existed.
+  library, name, round, reason, source_ref) as the auditable record of why
+  and (when discovered via objstat) where. `full` remains the default;
+  `xref.harvest`/`catalog.harvest` full-mode behavior must stay
+  byte-identical to before targeted mode existed. Per-file pulls
+  (DSPFFD/DSPDBR, scoped catalog SELECTs) follow the slice into libraries
+  outside the configured `libraries` when `library_discovery: slice` (the
+  default); `library_discovery: none` restores the strictly-configured
+  restriction. Broad `*ALL` commands (DSPPGMREF) never leave `libraries` in
+  either mode — the design principle "configuration, not discovery" still
+  governs which libraries the broad scan touches; only per-object source
+  *location* is discovered.
 
 ## Lineage semantics
 

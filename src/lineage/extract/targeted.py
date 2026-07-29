@@ -28,14 +28,36 @@ members). Targeted extraction instead:
    the round cap.
 
 Every slice addition is recorded in ``slice_objects`` (kind, library, name,
-round, reason) — the auditable record of *why* each object was downloaded.
-This module never widens what full mode would pull; it only ever narrows.
+round, reason, source_ref) — the auditable record of *why* each object was
+downloaded and, when discovered, *where* its source actually lives.
+
+Two source-discovery mechanisms feed the member-fetch step:
+
+* **objstat discovery** (:mod:`lineage.extract.objinfo`) — each slice
+  program/file with a resolved library is asked, via
+  ``QSYS2.OBJECT_STATISTICS``, where its source actually lives. This is
+  authoritative and immune to member-name != object-name mismatches, so
+  ``source_files`` in config becomes optional for targeted mode (still used,
+  plus any discovered source files, for the fallback below).
+* **Name-matching fallback** — for objects objstat could not place (no
+  library to look up, no hit, or a probe failure) and for ``member``-kind
+  entries (``/COPY``, ``RUNSQLSTM``, which are name-only), the object's name
+  is matched against the enumerated members of the *dynamic* source-file
+  list: configured ``source_files`` plus any ``SourceFileRef`` discovered via
+  an objstat hit or a qualified ``/COPY`` directive.
+
+``library_discovery: slice`` (the default) additionally lets per-file pulls
+(DSPFFD/DSPDBR, scoped catalog SELECTs) follow the slice into libraries
+outside the configured `libraries` scan list; ``library_discovery: none``
+restores the strictly-configured restriction. Broad ``*ALL`` commands
+(DSPPGMREF) never leave ``config.libraries`` in either mode — this module
+never widens what full mode would pull; it only ever narrows.
 """
 from __future__ import annotations
 
 from typing import Optional
 
-from ..config import Config
+from ..config import Config, SourceFileRef
 from .connection import HostSession
 from .hostinfo import HostProfile
 
@@ -87,14 +109,25 @@ class _Slice:
             "library": lib, "round": round_, "reason": reason}
         return True
 
+    def set_source_ref(self, kind: str, library: Optional[str], name: str,
+                       source_ref: str) -> None:
+        """Record where an entry's source was found (objstat discovery)."""
+        lib = library.upper() if library else None
+        key = (kind, lib, name.strip().upper())
+        if key in self._entries:
+            self._entries[key]["source_ref"] = source_ref
+
     def names(self) -> set[str]:
         return {name for _, _, name in self._entries}
+
+    def all(self) -> list[tuple[str, Optional[str], str]]:
+        return list(self._entries.keys())
 
     def of_kind(self, kind: str) -> set[tuple[Optional[str], str]]:
         return {(lib, name) for (k, lib, name) in self._entries if k == kind}
 
     def rows(self) -> list[tuple]:
-        return [(kind, lib, name, e["round"], e["reason"])
+        return [(kind, lib, name, e["round"], e["reason"], e.get("source_ref"))
                 for (kind, lib, name), e in self._entries.items()]
 
     def __len__(self) -> int:
@@ -142,7 +175,7 @@ def harvest_targeted(session: HostSession, con, config: Config,
     from ..db import insert_rows
     from ..graph.build import build_graph
     from ..graph.resolve import backward_lineage
-    from . import catalog, xref
+    from . import catalog, objinfo, xref
     from .source import enumerate_members, retrieve_member
 
     counts: dict[str, int] = {}
@@ -188,30 +221,89 @@ def harvest_targeted(session: HostSession, con, config: Config,
                     pgm_names.add(pname.upper())
 
     # -- 3. Iterative rounds: scoped host pulls + member fetch to closure ---
-    member_cache: dict[str, list[dict]] = {}   # srcfile -> enumerate_members()
-    fetched_members: set[str] = set()          # member names already retrieved
+    member_cache: dict[str, list[dict]] = {}   # "LIB/FILE" -> enumerate_members()
+    # (source_library, source_file, member) already retrieved this run.
+    fetched_members: set[tuple[str, str, str]] = set()
+    # (kind, library, name) -> objinfo.source_location() result, once looked
+    # up (None = probed, no hit). Absent key = not probed yet.
+    src_locations: dict[tuple[str, str, str], Optional[tuple[str, str, str]]] = {}
     n_members_retrieved = 0
     n_source_lines = 0
     rounds_run = 0
     seen_files: set[tuple[str, str]] = set()   # (lib, name) already round-processed
-    # Targeted mode must only ever narrow full mode's pulls: a slice file in
-    # a library outside the configured scan set is never pulled (full mode
-    # would not touch that library either) — it surfaces as an outside_scope
-    # gap at graph build, same as in full mode.
+    # Targeted mode must only ever narrow full mode's pulls: broad commands
+    # (DSPPGMREF *ALL) never leave config.libraries in either
+    # library_discovery mode. Per-file pulls (DSPFFD/DSPDBR/scoped catalog)
+    # follow the slice into libraries outside config.libraries when
+    # library_discovery == "slice" (default); "none" keeps the file in the
+    # slice (audit trail, member-name matching) but never pulls it — same as
+    # full mode would (it would not touch that library either), surfacing as
+    # an outside_scope gap at graph build.
     allowed_libs = {lib.upper() for lib in config.libraries}
+    discover_libs = config.library_discovery == "slice"
+    libraries_discovered: set[str] = set()
+
+    # Dynamic source-file list the name-matching fallback searches: the
+    # configured source_files plus any SourceFileRef discovered via an
+    # objstat hit or a qualified /COPY directive.
+    dynamic_source_files: list[SourceFileRef] = list(config.source_files)
+    dynamic_keys = {(s.library.upper(), s.file.upper()) for s in dynamic_source_files}
+    n_configured_source_files = len(dynamic_source_files)
+
+    def _ensure_source_file(lib: str, file: str) -> None:
+        key = (lib.upper(), file.upper())
+        if key not in dynamic_keys:
+            dynamic_keys.add(key)
+            dynamic_source_files.append(SourceFileRef(library=lib, file=file))
+
+    def _enumerate_cached(lib: str, file: str) -> list[dict]:
+        key = f"{lib.upper()}/{file.upper()}"
+        if key not in member_cache:
+            member_cache[key] = enumerate_members(
+                session, SourceFileRef(library=lib, file=file), profile)
+        return member_cache[key]
+
+    def _retrieve_and_discover(lib: str, srcfile: str, member: str,
+                               mtype: str | None, round_no: int) -> None:
+        nonlocal n_members_retrieved, n_source_lines
+        src_ref = SourceFileRef(library=lib, file=srcfile)
+        lines, _strategy = retrieve_member(session, src_ref, member, config,
+                                           profile)
+        rows = [(lib, srcfile, member, mtype, seq, text) for seq, text in lines]
+        n_members_retrieved += 1
+        n_source_lines += insert_rows(
+            con, "raw_source_members",
+            ["library", "srcfile", "member", "member_type", "seq", "line_text"],
+            rows)
+        new_names, src_hints = _discover_names(lib, srcfile, member, mtype,
+                                               lines, con, config)
+        for ref in src_hints:
+            _ensure_source_file(ref.library, ref.file)
+        for kind, nlib, nname, reason in new_names:
+            sl.add(kind, nlib, nname, round_no, reason)
 
     for round_no in range(1, MAX_ROUNDS + 1):
-        new_files = [(lib, name) for lib, name in sl.of_kind("file")
-                    if (lib, name) not in seen_files
-                    and lib and lib.upper() in allowed_libs]
-        # Files with no resolvable library, or in an unconfigured library,
-        # can't/mustn't be pulled; they stay in the slice (for member-name
-        # matching and the audit trail) but are marked processed.
-        for lib, name in sl.of_kind("file"):
-            if not lib or lib.upper() not in allowed_libs:
-                seen_files.add((lib, name))
+        if discover_libs:
+            new_files = [(lib, name) for lib, name in sl.of_kind("file")
+                        if (lib, name) not in seen_files and lib]
+            for lib, name in sl.of_kind("file"):
+                if not lib:
+                    seen_files.add((lib, name))
+        else:
+            new_files = [(lib, name) for lib, name in sl.of_kind("file")
+                        if (lib, name) not in seen_files
+                        and lib and lib.upper() in allowed_libs]
+            # Files with no resolvable library, or in an unconfigured
+            # library, can't/mustn't be pulled; they stay in the slice (for
+            # member-name matching and the audit trail) but are marked
+            # processed.
+            for lib, name in sl.of_kind("file"):
+                if not lib or lib.upper() not in allowed_libs:
+                    seen_files.add((lib, name))
         for pair in new_files:
             seen_files.add(pair)
+            if pair[0].upper() not in allowed_libs:
+                libraries_discovered.add(pair[0].upper())
 
         did_anything = bool(new_files)
         if new_files:
@@ -234,37 +326,63 @@ def harvest_targeted(session: HostSession, con, config: Config,
                     if sl.add("file", blib, bfile, round_no, "dspdbr_based_on"):
                         did_anything = True
 
-        # Member fetch/parse: any slice object (program/file/member) whose
-        # name matches a not-yet-retrieved member of a configured source file.
-        pending_names = sl.names() - fetched_members
-        newly_fetched: list[tuple[str, str, str, str | None]] = []  # lib, srcfile, member, type
-        if pending_names:
-            for src in config.source_files:
-                key = f"{src.library}/{src.file}"
-                if key not in member_cache:
-                    member_cache[key] = enumerate_members(session, src, profile)
-                for m in member_cache[key]:
-                    mname = (m.get("member") or "").upper()
-                    if mname in pending_names and mname not in fetched_members:
-                        newly_fetched.append(
-                            (src.library, src.file, mname, m.get("member_type")))
-                        fetched_members.add(mname)
+        # -- Source-location discovery: ask each not-yet-probed slice
+        # program/file with a resolved library where its source actually
+        # lives (authoritative — immune to member-name != object-name
+        # mismatches). On a hit, fetch the *recorded* member (which may
+        # differ from the object name) from its recorded source file. -------
+        for kind, obj_type in (("program", "*PGM"), ("file", "*FILE")):
+            for lib, name in sl.of_kind(kind):
+                if not lib:
+                    continue
+                key = (kind, lib, name)
+                if key in src_locations:
+                    continue
+                loc = objinfo.source_location(session, lib, name, obj_type)
+                src_locations[key] = loc
+                if loc is None:
+                    continue
+                srclib, srcfile, srcmbr = loc
+                _ensure_source_file(srclib, srcfile)
+                sl.set_source_ref(kind, lib, name,
+                                  f"{srclib}/{srcfile}({srcmbr})")
+                members = _enumerate_cached(srclib, srcfile)
+                mtype = None
+                for m in members:
+                    if (m.get("member") or "").upper() == srcmbr.upper():
+                        mtype = m.get("member_type")
+                        break
+                member_key = (srclib.upper(), srcfile.upper(), srcmbr.upper())
+                if member_key not in fetched_members:
+                    fetched_members.add(member_key)
+                    _retrieve_and_discover(srclib, srcfile, srcmbr, mtype,
+                                           round_no)
+                    did_anything = True
 
-        for lib, srcfile, member, mtype in newly_fetched:
-            did_anything = True
-            src_ref = _find_source_ref(config, lib, srcfile)
-            lines, _strategy = retrieve_member(session, src_ref, member, config,
-                                               profile)
-            rows = [(lib, srcfile, member, mtype, seq, text) for seq, text in lines]
-            n_members_retrieved += 1
-            n_source_lines += insert_rows(
-                con, "raw_source_members",
-                ["library", "srcfile", "member", "member_type", "seq", "line_text"],
-                rows)
-            new_names = _discover_names(lib, srcfile, member, mtype, lines, con,
-                                        config)
-            for kind, nlib, nname, reason in new_names:
-                if sl.add(kind, nlib, nname, round_no, reason):
+        # -- Name-matching fallback: for slice objects objstat couldn't
+        # place (no resolvable library, no hit, or a probe failure) and for
+        # 'member'-kind entries (/COPY, RUNSQLSTM — name-only, never
+        # objstat-probed) — match the object's name against the enumerated
+        # members of the dynamic source-file list (configured + discovered).
+        fallback_names: set[str] = set()
+        for kind, lib, name in sl.all():
+            if kind == "member":
+                fallback_names.add(name)
+            elif kind in ("program", "file"):
+                if not lib or src_locations.get((kind, lib, name)) is None:
+                    fallback_names.add(name)
+        if fallback_names:
+            for src in dynamic_source_files:
+                for m in _enumerate_cached(src.library, src.file):
+                    mname = (m.get("member") or "").upper()
+                    if mname not in fallback_names:
+                        continue
+                    member_key = (src.library.upper(), src.file.upper(), mname)
+                    if member_key in fetched_members:
+                        continue
+                    fetched_members.add(member_key)
+                    _retrieve_and_discover(src.library, src.file, mname,
+                                           m.get("member_type"), round_no)
                     did_anything = True
 
         rounds_run = round_no
@@ -272,7 +390,8 @@ def harvest_targeted(session: HostSession, con, config: Config,
             break
 
     insert_rows(con, "slice_objects",
-                ["kind", "library", "name", "round", "reason"], sl.rows())
+                ["kind", "library", "name", "round", "reason", "source_ref"],
+                sl.rows())
 
     counts["slice.rounds"] = rounds_run
     counts["slice.programs"] = len(sl.of_kind("program"))
@@ -280,23 +399,21 @@ def harvest_targeted(session: HostSession, con, config: Config,
     counts["slice.members_retrieved"] = n_members_retrieved
     counts["slice.source_lines"] = n_source_lines
     counts["slice.total_objects"] = len(sl)
+    counts["slice.source_files_discovered"] = (
+        len(dynamic_source_files) - n_configured_source_files)
+    counts["slice.libraries_discovered"] = len(libraries_discovered)
     return counts
-
-
-def _find_source_ref(config: Config, library: str, srcfile: str):
-    for src in config.source_files:
-        if src.library.upper() == library.upper() and src.file.upper() == srcfile.upper():
-            return src
-    # Fallback: shouldn't happen (srcfile came from config.source_files).
-    from ..config import SourceFileRef
-    return SourceFileRef(library=library, file=srcfile)
 
 
 def _discover_names(library: str, srcfile: str, member: str,
                     member_type: str | None, lines: list[tuple[int, str]],
-                    con, config: Config) -> list[tuple[str, Optional[str], str, str]]:
+                    con, config: Config
+                    ) -> tuple[list[tuple[str, Optional[str], str, str]],
+                              list[SourceFileRef]]:
     """Parse one freshly fetched member in memory; return new slice entries
-    as (kind, library, name, reason). Never writes to the database — the
+    as (kind, library, name, reason), plus any source files an explicit
+    ``/COPY`` directive names (added to the dynamic source-file list the
+    name-matching fallback searches). Never writes to the database — the
     normal ``lineage parse`` stage does that over ``raw_source_members``.
     """
     from ..parse.base import SourceMember
@@ -304,6 +421,7 @@ def _discover_names(library: str, srcfile: str, member: str,
                      member_type=member_type,
                      lines=[text for _, text in lines])
     out: list[tuple[str, Optional[str], str, str]] = []
+    src_hints: list[SourceFileRef] = []
 
     if m.is_cl():
         from ..parse.cl import parse as parse_cl
@@ -354,6 +472,12 @@ def _discover_names(library: str, srcfile: str, member: str,
                 out.append(("file", lib, fname, "rpg_file"))
         for c in prog.copies:
             out.append(("member", None, c.member, "copy_member"))
+            # Explicit lib/srcfile on the /COPY directive resolves in order:
+            # this (added to the dynamic set) -> source files already
+            # discovered -> configured source_files (both covered by the
+            # dynamic set the fallback searches).
+            if c.library and c.srcfile:
+                src_hints.append(SourceFileRef(library=c.library, file=c.srcfile))
         for blk in prog.sql_blocks:
             out.extend(_sql_table_names(blk, con, config))
 
@@ -362,7 +486,7 @@ def _discover_names(library: str, srcfile: str, member: str,
         for stmt in split_sql_script(m.text):
             out.extend(_sql_table_names(stmt, con, config))
 
-    return out
+    return out, src_hints
 
 
 def _sql_table_names(sql: str, con, config: Config

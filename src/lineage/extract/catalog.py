@@ -43,7 +43,7 @@ class PullSpec:
     schema_filter: str             # column filtering by library
     cols: tuple[ColSpec, ...]
 
-    def build_select(self, available: set[str], libs_in: str,
+    def build_select(self, available: set[str], libs_in: Optional[str],
                      extra_where: Optional[str] = None
                      ) -> tuple[str, list[str]]:
         """Return (sql, missing_optional_raw_columns).
@@ -51,7 +51,10 @@ class PullSpec:
         Raises ``CatalogShapeError`` when a required column has no available
         candidate. ``extra_where``, when given, is AND-ed onto the WHERE
         clause (used to scope a pull to a chunked list of (schema, name)
-        pairs — see :func:`pairs_filter`).
+        pairs — see :func:`pairs_filter`). ``libs_in`` of ``None`` omits the
+        ``schema_filter IN (...)`` conjunct entirely — used for pairs pulls,
+        where the (schema, name) pairs already pin the scope exactly, so
+        libraries outside the configured scan list can still be reached.
         """
         parts: list[str] = []
         missing: list[str] = []
@@ -64,10 +67,14 @@ class PullSpec:
                 parts.append(f"CAST(NULL AS VARCHAR(1)) AS {col.raw}")
             else:
                 parts.append(f"{picked} AS {col.raw}")
-        sql = (f"SELECT {', '.join(parts)} FROM QSYS2.{self.catalog_view} "
-               f"WHERE {self.schema_filter} IN ({libs_in})")
+        where_clauses: list[str] = []
+        if libs_in is not None:
+            where_clauses.append(f"{self.schema_filter} IN ({libs_in})")
         if extra_where:
-            sql += f" AND ({extra_where})"
+            where_clauses.append(f"({extra_where})")
+        where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
+        sql = (f"SELECT {', '.join(parts)} FROM QSYS2.{self.catalog_view} "
+               f"WHERE {where_sql}")
         return sql, missing
 
 
@@ -256,7 +263,11 @@ def harvest(session: HostSession, con, config,
             rows: list[tuple] = []
             missing: list[str] = []
             for frag in pairs_filter(spec.schema_filter, "TABLE_NAME", todo):
-                sql, missing = spec.build_select(available, libs, extra_where=frag)
+                # No TABLE_SCHEMA IN (...) conjunct here: the pairs already
+                # pin exact (schema, name) scope, so a slice object in a
+                # library outside config.libraries is still reachable
+                # (library_discovery: slice — see extract/targeted.py).
+                sql, missing = spec.build_select(available, None, extra_where=frag)
                 res = _fetch(session, f"catalog.{spec.name}", sql)
                 rows.extend(
                     tuple(r) for r in res.rows

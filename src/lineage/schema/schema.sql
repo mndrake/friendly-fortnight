@@ -109,7 +109,9 @@ CREATE TABLE IF NOT EXISTS slice_objects (
     library        VARCHAR,
     name           VARCHAR,
     round          INTEGER,   -- 0 = seed/backward-walk/caller, 1..5 = iterative rounds
-    reason         VARCHAR    -- seed / backward_walk / caller / dspdbr_based_on / ...
+    reason         VARCHAR,   -- seed / backward_walk / caller / dspdbr_based_on / ...
+    source_ref     VARCHAR    -- library/srcfile(member) where the object's source
+                               -- was found via objstat discovery; NULL when none
 );
 
 -- =========================================================================

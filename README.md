@@ -82,9 +82,24 @@ For live-host extraction include the `host` extra (jaydebeapi/JPype):
    `output_seeds` plus their transitive callers: scoped SYSCOLUMNS/
    SYSPARTITIONSTAT, per-file DSPFFD/DSPDBR, and only the source members
    that slice actually needs (capped at 5 rounds). Every object pulled is
-   recorded in the `slice_objects` table with the round and reason it
-   entered the slice, so a targeted run is auditable. `extraction_scope:
-   full` (the default) is unaffected either way.
+   recorded in the `slice_objects` table with the round, reason it entered
+   the slice, and (when discovered) `source_ref` — where its source was
+   found — so a targeted run is auditable. `extraction_scope: full` (the
+   default) is unaffected either way.
+
+   Targeted mode asks each slice program/file where its source actually
+   lives (`QSYS2.OBJECT_STATISTICS`) instead of assuming the member name
+   matches the object name — authoritative, and immune to member-name !=
+   object-name mismatches. This means `source_files` becomes **optional**
+   for targeted runs (still required, and validated at `extract` time, for
+   `extraction_scope: full`); it's only used as a name-matching fallback for
+   objects objstat can't place and for `/COPY`/`RUNSQLSTM` members. Separately,
+   `library_discovery: slice` (the default) lets per-file pulls follow the
+   slice into libraries outside the configured `libraries` scan list — set
+   `library_discovery: none` to restore the strictly-configured restriction
+   (slice objects outside `libraries` are still recorded for the audit trail,
+   just never pulled). Broad `*ALL` commands never leave `libraries` in
+   either mode.
 5. Run the stages (each is re-runnable):
 
 ```sh
