@@ -47,7 +47,15 @@ _COPY_RE = re.compile(r"^.{5}\s?/(?:COPY|INCLUDE)\s+(\S+)", re.IGNORECASE)
 _COPY_FREE_RE = re.compile(r"^\s*/(?:COPY|INCLUDE)\s+(\S+)", re.IGNORECASE)
 _DCLF_RE = re.compile(r"^\s*DCL-F\s+([A-Z0-9#$@_]+)(.*?);?\s*$", re.IGNORECASE)
 _KW_RE = re.compile(r"([A-Z][A-Z0-9]*)\s*\(([^)]*)\)", re.IGNORECASE)
-_FREE_OP_RE = re.compile(r"^\s*([A-Z]+)\b", re.IGNORECASE)
+_FREE_OP_RE = re.compile(r"^\s*([A-Z][A-Z0-9-]*)\b", re.IGNORECASE)
+
+# Referenced-field token harvesting (design: "Column usage from CL and RPG
+# parsing"). Pure token collection — no opcode semantics. A candidate token
+# is a plain identifier; figurative constants/indicators (*BLANK, *INxx, ...),
+# quoted literals and pure numbers are excluded by construction.
+_FIELD_TOKEN_RE = re.compile(r"^[A-Z#$@][A-Z0-9#$@_]*$")
+_STAR_KEYWORD_RE = re.compile(r"\*[A-Z0-9]+", re.IGNORECASE)
+_STRING_LITERAL_RE = re.compile(r"'(?:[^']|'')*'")
 # F-spec continuation option: K RENAME (RPG III) — external format in 19-28,
 # new name after RENAME. Scanned loosely: "K" then "RENAME" then the new name.
 _KRENAME_RE = re.compile(r"\bKRENAME\s*([A-Z0-9#$@_]*)", re.IGNORECASE)
@@ -88,6 +96,12 @@ class RpgProgram:
     sql_blocks: list[str] = field(default_factory=list)
     has_ospecs: bool = False
     has_ispecs: bool = False
+    # Identifier tokens seen in C-spec factor1/factor2/result and O-spec
+    # field-entry areas — candidate "referenced fields" for column usage.
+    # Not filtered against a file's real field set here (that intersection
+    # happens in the graph build, once DSPFFD is available); this is
+    # deliberately loose ("intersection filters everything").
+    referenced_fields: set[str] = field(default_factory=set)
 
 
 def _kw(text: str) -> dict[str, str]:
@@ -106,6 +120,61 @@ def _is_comment(line: str, rpg3: bool) -> bool:
     if not rpg3 and (s.startswith("//")):
         return True
     return False
+
+
+def _area_tokens(area: str, exclude: set[str]) -> set[str]:
+    """Clean identifier tokens out of a fixed-column factor/result area.
+
+    Whitespace-split, then each candidate is upper-cased and kept only if it
+    looks like a plain identifier (``_FIELD_TOKEN_RE``) and is not in
+    ``exclude`` (declared file names). Figurative constants (``*BLANK``),
+    quoted literals and pure numeric literals never match the identifier
+    pattern, so they drop out without special-casing.
+    """
+    out: set[str] = set()
+    for raw in area.split():
+        tok = raw.strip("()").upper()
+        if not tok or not _FIELD_TOKEN_RE.match(tok) or tok in exclude:
+            continue
+        out.add(tok)
+    return out
+
+
+def _harvest_cspec_fields(line: str, known_files: set[str], rpg3: bool) -> set[str]:
+    """Factor1/factor2/result identifier tokens for one fixed-format C-spec
+    line (RPG III or RPG IV column layout)."""
+    if rpg3:
+        areas = (line[17:27] if len(line) > 17 else "",
+                 line[32:42] if len(line) > 32 else "",
+                 line[42:48] if len(line) > 42 else "")
+    else:
+        areas = (line[11:25] if len(line) > 11 else "",
+                 line[35:49] if len(line) > 35 else "",
+                 line[49:63] if len(line) > 49 else "")
+    out: set[str] = set()
+    for area in areas:
+        out |= _area_tokens(area, known_files)
+    return out
+
+
+def _harvest_free_fields(stmt: str, known_files: set[str]) -> set[str]:
+    """Identifier tokens for a free-format statement, minus the leading
+    opcode and declared file names. Declarations (``DCL-*``) are skipped —
+    they introduce names, they do not reference existing fields."""
+    m = _FREE_OP_RE.match(stmt)
+    opcode = m.group(1).upper() if m else ""
+    if not opcode or opcode.startswith("DCL"):
+        return set()
+    text = _STRING_LITERAL_RE.sub(" ", stmt)
+    text = _STAR_KEYWORD_RE.sub(" ", text)
+    exclude = known_files | {opcode}
+    out: set[str] = set()
+    for raw in re.findall(r"[A-Za-z#$@][A-Za-z0-9#$@_]*", text):
+        tok = raw.upper()
+        if not _FIELD_TOKEN_RE.match(tok) or tok in exclude:
+            continue
+        out.add(tok)
+    return out
 
 
 def _parse_copy_arg(arg: str) -> RpgCopy:
@@ -195,10 +264,17 @@ def parse(member: SourceMember) -> RpgProgram:
             continue
         if ftype == "O":
             prog.has_ospecs = True
+            # Field-entry area: idx 31:43 (loose — the DSPFFD intersection
+            # in the graph build filters out anything that isn't a real
+            # field, so record format names etc. are harmless surplus).
+            prog.referenced_fields |= _area_tokens(
+                line[31:43] if len(line) > 31 else "", known_files)
             i += 1
             continue
 
         if ftype == "C":
+            prog.referenced_fields |= _harvest_cspec_fields(
+                line, known_files, rpg3=rpg3)
             op = _parse_cspec_io(line, seq + 1, known_files, rpg3=rpg3)
             if op is not None:
                 seq += 1
@@ -207,6 +283,7 @@ def parse(member: SourceMember) -> RpgProgram:
             continue
 
         if not rpg3:
+            prog.referenced_fields |= _harvest_free_fields(stripped, known_files)
             op = _parse_free_io(stripped, seq + 1, known_files)
             if op is not None:
                 seq += 1
@@ -373,7 +450,7 @@ def parse_all(con) -> dict[str, int]:
     from ..db import insert_rows
     from .base import load_members
 
-    file_rows, io_rows = [], []
+    file_rows, io_rows, field_ref_rows = [], [], []
     n = 0
     sql_pending: list[tuple[str, str]] = []  # (program_id, sql) for embedded_sql
     for m in load_members(con):
@@ -389,11 +466,15 @@ def parse_all(con) -> dict[str, int]:
                             op.direction))
         for blk in prog.sql_blocks:
             sql_pending.append((prog.program_id, blk))
+        for fld in sorted(prog.referenced_fields):
+            field_ref_rows.append((prog.program_id, fld))
     insert_rows(con, "parsed_rpg_files",
                 ["program", "file", "usage", "extname", "rename_rec",
                  "declared_via"], file_rows)
     insert_rows(con, "parsed_rpg_io_ops",
                 ["program", "seq", "opcode", "file", "direction"], io_rows)
+    insert_rows(con, "parsed_rpg_field_refs",
+                ["program", "field_name"], field_ref_rows)
     # Stash embedded SQL blocks for the SQL parser to consume.
     con.execute("CREATE TEMP TABLE IF NOT EXISTS _rpg_sql_blocks "
                 "(program VARCHAR, seq INTEGER, raw_sql VARCHAR)")
@@ -402,4 +483,5 @@ def parse_all(con) -> dict[str, int]:
         con.execute("INSERT INTO _rpg_sql_blocks VALUES (?, ?, ?)",
                     [pid, idx, blk])
     return {"rpg_programs": n, "rpg_files": len(file_rows),
-            "rpg_io_ops": len(io_rows), "rpg_sql_blocks": len(sql_pending)}
+            "rpg_io_ops": len(io_rows), "rpg_sql_blocks": len(sql_pending),
+            "rpg_field_refs": len(field_ref_rows)}

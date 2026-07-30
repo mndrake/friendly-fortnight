@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import networkx as nx
 
-from ..graph.model import Confidence
+from ..graph.model import Confidence, EdgeKind, min_confidence
 from ..graph.resolve import backward_lineage, base_physical_files
 
 
@@ -35,7 +35,7 @@ def compute_output_lineage(con, graph: nx.MultiDiGraph, config) -> dict[str, int
         if bases:
             seeds_resolved += 1
         for node, (depth, conf) in sorted(bases.items()):
-            rows.append((seed.id, node, None, depth, conf.value))
+            rows.append((seed.id, node, None, depth, conf.value, "derives"))
         base_files = {b.split(":", 1)[1].split("(")[0] for b in bases}
 
         # Column-level: walk backward from the seed file's own column nodes
@@ -59,8 +59,36 @@ def compute_output_lineage(con, graph: nx.MultiDiGraph, config) -> dict[str, int
         for node, (depth, conf) in sorted(col_hits.items()):
             file_part = node.split(":", 1)[1].rsplit(".", 1)[0]
             rows.append((seed.id, f"file:{file_part}", node, depth,
-                         conf.value))
+                         conf.value, "derives"))
+
+        # Usage: every program on the output's path, and its reads->column
+        # edges that land on a base physical file of this output. Distinct
+        # from the "derives" rows above — "used en route", not "maps into
+        # the output".
+        usage_hits: dict[str, tuple[int, Confidence]] = {}
+        for node, (path_depth, path_conf) in lineage.items():
+            if not node.startswith("program:") or not graph.has_node(node):
+                continue
+            for _, dst, k in graph.out_edges(node, keys=True):
+                data = graph.edges[node, dst, k]
+                if (data.get("kind") != EdgeKind.READS.value
+                        or not dst.startswith("column:")):
+                    continue
+                file_part = dst.split(":", 1)[1].rsplit(".", 1)[0]
+                if file_part not in base_files:
+                    continue
+                edge_conf = Confidence(data.get("confidence"))
+                combined = min_confidence(path_conf, edge_conf)
+                depth = path_depth + 1
+                prev = usage_hits.get(dst)
+                if (prev is None or depth < prev[0]
+                        or (depth == prev[0] and combined.rank > prev[1].rank)):
+                    usage_hits[dst] = (depth, combined)
+        for node, (depth, conf) in sorted(usage_hits.items()):
+            file_part = node.split(":", 1)[1].rsplit(".", 1)[0]
+            rows.append((seed.id, f"file:{file_part}", node, depth,
+                         conf.value, "used"))
     insert_rows(con, "output_lineage",
                 ["output_id", "source_file", "source_column", "path_len",
-                 "min_confidence"], rows)
+                 "min_confidence", "relation"], rows)
     return {"output_lineage_rows": len(rows), "seeds_resolved": seeds_resolved}

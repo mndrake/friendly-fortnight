@@ -21,7 +21,8 @@ def coverage(con, config) -> dict:
     lineage_by_output: dict[str, list] = defaultdict(list)
     for output_id, source_file, min_conf in con.execute(
             "SELECT output_id, source_file, min_confidence "
-            "FROM output_lineage WHERE source_column IS NULL").fetchall():
+            "FROM output_lineage WHERE source_column IS NULL "
+            "AND relation = 'derives'").fetchall():
         lineage_by_output[output_id].append((source_file, min_conf))
 
     gap_rows = con.execute(

@@ -110,6 +110,19 @@ Rules that must hold:
   `parse/classify.py`) and lineage fidelity follows the class; complex
   programs contribute table-level edges only. Same-name field expansion for
   externally described I/O is tagged `inferred`, never `parsed`.
+- Column usage (program actually reads column X, vs. "column X maps into
+  output Y") is a separate relation from field-flow mapping: `EdgeKind.READS`
+  edges from `program:*` to `column:*` (provenance `source_rpg` /
+  `source_sql` / `source_cl`), built by `graph/build.py::_column_usage_edges`
+  from pure identifier-token harvesting (RPG C/O-spec, every SQL column
+  reference, CPYF FROMFILE∩TOFILE) — never RPG dataflow interpretation.
+  `confidence=parsed` only when a real field name was seen in the source;
+  `inferred` is the record-level fallback (every field of a file the program
+  reads, when no field-level evidence exists). `output_lineage.relation`
+  distinguishes the two views: `'derives'` (the pre-existing target-mapping
+  rows) vs `'used'` (read en route to an output, not necessarily mapped into
+  it) — `gaps.py::coverage` and the file-level commonality matrix stay scoped
+  to `'derives'` so usage evidence never flips a resolved/partial status.
 
 ## RPG dialect
 

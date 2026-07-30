@@ -25,7 +25,8 @@ LAYER_TABLES: dict[str, tuple[str, ...]] = {
     "parsed": (
         "parsed_cl_statements", "parsed_cl_overrides", "parsed_cl_calls",
         "parsed_dds_files", "parsed_dds_fields", "parsed_rpg_files",
-        "parsed_rpg_io_ops", "parsed_sql_statements", "program_classification",
+        "parsed_rpg_io_ops", "parsed_rpg_field_refs", "parsed_sql_statements",
+        "program_classification",
     ),
     "graph": ("nodes", "edges"),
     "analysis": (
@@ -58,6 +59,24 @@ def connect(path: str | Path | None = None) -> duckdb.DuckDBPyConnection:
 
 def apply_schema(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(schema_sql())
+    _migrate(con)
+
+
+# Columns added to already-shipped tables after their initial release.
+# ``CREATE TABLE IF NOT EXISTS`` never widens an existing table, so a store
+# created before a column was added needs it patched in explicitly.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("parsed_sql_statements", "columns_used", "VARCHAR"),
+    ("output_lineage", "relation", "VARCHAR DEFAULT 'derives'"),
+)
+
+
+def _migrate(con: duckdb.DuckDBPyConnection) -> None:
+    for table, column, coltype in _ADDED_COLUMNS:
+        existing = {r[1] for r in con.execute(
+            f"PRAGMA table_info('{table}')").fetchall()}
+        if column not in existing:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
 
 def reset_layer(con: duckdb.DuckDBPyConnection, layer: str) -> None:

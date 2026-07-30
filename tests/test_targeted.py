@@ -124,7 +124,8 @@ def test_full_and_targeted_output_lineage_match(config):
         compute_output_lineage(con, g, config)
         rows = con.execute(
             "SELECT output_id, source_file, source_column, path_len, "
-            "min_confidence FROM output_lineage ORDER BY 1, 2, 3, 4, 5"
+            "min_confidence, relation FROM output_lineage "
+            "ORDER BY 1, 2, 3, 4, 5, 6"
         ).fetchall()
         con.close()
         return rows

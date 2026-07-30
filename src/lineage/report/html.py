@@ -58,15 +58,20 @@ def render(con, coverage: dict, out_path: str | Path) -> Path:
     parts.append("</div>")
 
     # Coverage per output
+    cols_used = dict(con.execute(
+        "SELECT output_id, count(DISTINCT source_column) FROM output_lineage "
+        "WHERE relation = 'used' GROUP BY output_id").fetchall())
     parts.append("<h2>Output coverage</h2><table><tr><th>Output</th>"
-                 "<th>Status</th><th>Base physical files</th><th>Reasons</th></tr>")
+                 "<th>Status</th><th>Base physical files</th>"
+                 "<th>Cols used</th><th>Reasons</th></tr>")
     for oid in sorted(outputs):
         o = outputs[oid]
         files = "<br>".join(f"<code>{_esc(f)}</code>" for f in o["base_files"]) or "—"
         parts.append(
             f"<tr><td>{_esc(oid)}</td>"
             f"<td class='status-{o['status']}'>{_esc(o['status'])}</td>"
-            f"<td>{files}</td><td>{_esc('; '.join(o['reasons']) or '')}</td></tr>")
+            f"<td>{files}</td><td>{cols_used.get(oid, 0)}</td>"
+            f"<td>{_esc('; '.join(o['reasons']) or '')}</td></tr>")
     parts.append("</table>")
 
     # Complexity buckets
@@ -114,6 +119,18 @@ def render(con, coverage: dict, out_path: str | Path) -> Path:
         parts.append("<h2>Top shared source files</h2><table>"
                      "<tr><th>Source</th><th># outputs</th></tr>")
         for src, n in top:
+            parts.append(f"<tr><td><code>{_esc(src)}</code></td><td>{n}</td></tr>")
+        parts.append("</table>")
+
+    # Top used source columns
+    top_cols = con.execute(
+        "SELECT source_id, count(DISTINCT output_id) AS n FROM "
+        "commonality_matrix WHERE source_id LIKE 'column:%' "
+        "GROUP BY source_id ORDER BY n DESC, source_id LIMIT 20").fetchall()
+    if top_cols:
+        parts.append("<h2>Top used source columns</h2><table>"
+                     "<tr><th>Column</th><th># outputs</th></tr>")
+        for src, n in top_cols:
             parts.append(f"<tr><td><code>{_esc(src)}</code></td><td>{n}</td></tr>")
         parts.append("</table>")
 

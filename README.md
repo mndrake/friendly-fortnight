@@ -139,6 +139,20 @@ Key behaviors:
   stripped first), DDS field mappings (RENAME/CONCAT/JREF), and — for
   `ext_described_io` programs — same-named-field record expansion tagged
   `inferred`.
+- **Column usage** (`output_lineage.relation = 'used'`, distinct from the
+  `'derives'` rows above): which base-file columns a program actually reads,
+  not just which columns map into an output. Sourced from RPG C-spec
+  factor1/factor2/result and O-spec field-entry tokens intersected against a
+  read file's DSPFFD fields (`parsed`; falls back to every field of the file
+  when nothing intersects, `inferred`), from every column referenced anywhere
+  in a SQL statement — not just the select list — and from CPYF
+  FROMFILE∩TOFILE field-name overlap (`parsed` under `FMTOPT(*MAP)`, else
+  `inferred`). This feeds an outputs × source-columns view of the
+  commonality matrix, sharpening data-product candidate sizing. Full
+  source→target field-flow mapping (MOVE/EVAL dataflow, I-spec renames,
+  O-spec output boundaries) is deliberately out of scope — it needs RPG logic
+  interpretation the rest of this tool avoids; usage analysis is the
+  lower-lift alternative and a documented future enhancement.
 - **Complexity buckets** per output: `replicate_as_view` / `moderate` /
   `full_reengineering` from path depth, complex programs en route, override
   edges, and unresolved edges.

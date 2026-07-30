@@ -35,6 +35,15 @@ class GraphBuilder:
         self.gaps: list[tuple[str, str, str, str]] = []  # kind, object, detail, context
         self._catalog_objects: set[tuple[str, str]] = set()
         self.resolver: Optional[LiblistResolver] = None
+        # program name (upper) -> declared file name (upper) -> resolved
+        # read-direction targets [(lib, file)], populated by _edges_from_rpg.
+        # Reused by the column-usage pass so it doesn't re-simulate overrides.
+        self._rpg_read_targets: dict[tuple[str, str], list[tuple[Optional[str], str]]] = \
+            defaultdict(list)
+        # CPYF events captured while building CL edges, replayed by the
+        # column-usage pass (no re-parsing / re-resolving liblist).
+        self._cpyf_events: list[dict] = []
+        self._ffd_cache: Optional[dict[tuple[str, str], set[str]]] = None
 
     # -- helpers -------------------------------------------------------------
 
@@ -103,6 +112,7 @@ class GraphBuilder:
         if self.phase >= 3:
             self._edges_from_rpg()
             self._edges_from_sql()
+            self._column_usage_edges()
             self._record_format_column_expansion()
         self._detect_missing_source()
         self._persist()
@@ -420,6 +430,13 @@ class GraphBuilder:
                 self.add_edge(Edge(src=pid, dst=tid, kind=EdgeKind.WRITES,
                                    provenance=Provenance.SOURCE_CL,
                                    confidence=Confidence.PARSED))
+                # Replayed by the column-usage pass (phase 3): which FROMFILE
+                # columns the CL program actually reads.
+                self._cpyf_events.append({
+                    "pid": pid, "from_lib": flib, "from_file": ffile,
+                    "to_lib": tlib, "to_file": tfile,
+                    "fmtopt": info.get("fmtopt"),
+                })
 
     def _apply_overrides_to_xref(self) -> None:
         """Redirect compiled (xref) file references through observed OVRDBFs.
@@ -519,6 +536,11 @@ class GraphBuilder:
                              "configured library", {"program": program})
                 targets = override_edges + [(lib, ext, None, {})]
 
+            if "reads" in directions:
+                key = (pname.upper(), fname.upper())
+                self._rpg_read_targets[key].extend(
+                    (lib, tf) for lib, tf, mbr, ctx in targets)
+
             for lib, tf, mbr, ctx in targets:
                 is_override = "override_origin" in ctx
                 prov = Provenance.SOURCE_CL if is_override else Provenance.SOURCE_RPG
@@ -614,6 +636,118 @@ class GraphBuilder:
                          "configured library", {"program": program})
         return self.add_file_node(lib, name)
 
+    # -- column usage (program -reads-> column) -------------------------------
+
+    def _dspffd_fields(self) -> dict[tuple[str, str], set[str]]:
+        """(LIB, FILE) -> set of field names, from raw_dspffd. Cached — used
+        by both the record-format expansion and the column-usage passes.
+        """
+        if self._ffd_cache is None:
+            ffd: dict[tuple[str, str], set[str]] = defaultdict(set)
+            for lib, fname, field_name in self.con.execute(
+                    "SELECT file_lib, file_name, field_name FROM raw_dspffd"
+            ).fetchall():
+                if lib and fname and field_name:
+                    ffd[(lib.upper(), fname.upper())].add(field_name.upper())
+            self._ffd_cache = ffd
+        return self._ffd_cache
+
+    def _column_usage_edges(self) -> None:
+        """Program -reads-> column edges (design: "Column usage from CL and
+        RPG parsing"): which source columns a program actually touches,
+        complementing (not replacing) the target-mapping heuristics below.
+        """
+        self._rpg_field_usage_edges()
+        self._sql_column_usage_edges()
+        self._cpyf_column_usage_edges()
+
+    def _rpg_field_usage_edges(self) -> None:
+        ffd = self._dspffd_fields()
+        refs: dict[str, set[str]] = defaultdict(set)
+        for program, field_name in self.con.execute(
+                "SELECT program, field_name FROM parsed_rpg_field_refs"
+        ).fetchall():
+            refs[program].add((field_name or "").upper())
+
+        rows = self.con.execute(
+            "SELECT program, file, usage FROM parsed_rpg_files "
+            "WHERE usage IN ('input', 'update', 'combined')").fetchall()
+        for program, fname, usage in rows:
+            plib, pname = self._split_qualified(program)
+            pid = self.add_program_node(plib, pname)
+            targets = self._rpg_read_targets.get(
+                (pname.upper(), (fname or "").upper()), [])
+            program_refs = refs.get(program, set())
+            for lib, tf in targets:
+                fields = ffd.get(((lib or "").upper(), (tf or "").upper()), set())
+                if not fields:
+                    continue
+                used = fields & program_refs
+                if used:
+                    for f in sorted(used):
+                        self.add_edge(Edge(
+                            src=pid, dst=column_id(lib, tf, f),
+                            kind=EdgeKind.READS, provenance=Provenance.SOURCE_RPG,
+                            confidence=Confidence.PARSED,
+                            context={"mechanism": "field_reference"}))
+                else:
+                    for f in sorted(fields):
+                        self.add_edge(Edge(
+                            src=pid, dst=column_id(lib, tf, f),
+                            kind=EdgeKind.READS, provenance=Provenance.SOURCE_RPG,
+                            confidence=Confidence.INFERRED,
+                            context={"mechanism": "record_io_all_fields"}))
+
+    def _sql_column_usage_edges(self) -> None:
+        rows = self.con.execute(
+            "SELECT program, stmt_type, tables_read, columns_used, parse_error "
+            "FROM parsed_sql_statements").fetchall()
+        for program, stmt_type, tr_json, cu_json, perr in rows:
+            if perr or stmt_type == "DYNAMIC":
+                continue
+            base_program = program.split("#")[0]
+            plib, pname = self._split_qualified(base_program)
+            pid = self.add_program_node(plib, pname)
+            read_tables = set(json.loads(tr_json or "[]"))
+            for ref in json.loads(cu_json or "[]"):
+                if "." not in ref:
+                    continue
+                table_part = ref.rsplit(".", 1)[0]
+                # Only columns of tables this statement actually reads — a
+                # target-only table (INSERT/UPDATE/MERGE) is not "used".
+                if table_part not in read_tables:
+                    continue
+                col_id = self._column_ref_to_id(ref)
+                if col_id is None:
+                    continue
+                self.add_edge(Edge(src=pid, dst=col_id, kind=EdgeKind.READS,
+                                   provenance=Provenance.SOURCE_SQL,
+                                   confidence=Confidence.PARSED,
+                                   context={"mechanism": "sql_reference"}))
+
+    def _cpyf_column_usage_edges(self) -> None:
+        ffd = self._dspffd_fields()
+        for ev in self._cpyf_events:
+            from_fields = ffd.get(
+                ((ev["from_lib"] or "").upper(), (ev["from_file"] or "").upper()),
+                set())
+            to_fields = ffd.get(
+                ((ev["to_lib"] or "").upper(), (ev["to_file"] or "").upper()),
+                set())
+            used = from_fields & to_fields
+            if not used:
+                continue
+            fmtopt = (ev.get("fmtopt") or "").upper()
+            is_map = "*MAP" in fmtopt
+            confidence = Confidence.PARSED if is_map else Confidence.INFERRED
+            mechanism = "cpyf_map" if is_map else "cpyf_layout"
+            for f in sorted(used):
+                self.add_edge(Edge(
+                    src=ev["pid"],
+                    dst=column_id(ev["from_lib"], ev["from_file"], f),
+                    kind=EdgeKind.READS, provenance=Provenance.SOURCE_CL,
+                    confidence=confidence, context={"mechanism": mechanism}))
+
     # -- record-format column expansion --------------------------------------
 
     def _record_format_column_expansion(self) -> None:
@@ -630,13 +764,7 @@ class GraphBuilder:
         if not ext_programs:
             return
 
-        # file (LIB, NAME) -> set of field names, from DSPFFD.
-        ffd: dict[tuple[str, str], set[str]] = defaultdict(set)
-        for lib, fname, field_name in self.con.execute(
-                "SELECT file_lib, file_name, field_name FROM raw_dspffd"
-        ).fetchall():
-            if lib and fname and field_name:
-                ffd[(lib.upper(), fname.upper())].add(field_name.upper())
+        ffd = self._dspffd_fields()
 
         # program -> (reads, writes) file node ids, from edges built so far.
         reads: dict[str, set[str]] = defaultdict(set)

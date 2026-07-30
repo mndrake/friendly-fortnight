@@ -246,6 +246,7 @@ def _parse_ovrdbf(prog, seq, stmt, resolve_name):
 def _parse_cpyf(prog, seq, stmt, resolve_name):
     from_raw = extract_param(stmt, "FROMFILE")
     to_raw = extract_param(stmt, "TOFILE")
+    fmtopt = extract_param(stmt, "FMTOPT")
     fval, fres, fexpr = resolve_name(from_raw)
     tval, tres, texpr = resolve_name(to_raw)
     from_lib, from_file = _split_qualified(fval) if fval else (None, None)
@@ -257,6 +258,7 @@ def _parse_cpyf(prog, seq, stmt, resolve_name):
         params=[json.dumps({
             "from_lib": from_lib, "from_file": from_file,
             "to_lib": to_lib, "to_file": to_file,
+            "fmtopt": fmtopt.strip() if fmtopt else None,
         })],
         resolved=fres and tres,
         expr=None if (fres and tres) else (fexpr or texpr),

@@ -112,6 +112,40 @@ def test_split_sql_script():
     assert "a;b" in stmts[1]
 
 
+def test_columns_used_includes_where_and_join_not_just_select_list():
+    a = analyze_statement(
+        "SELECT O.ORDNO FROM APPLIB.ORDERS O "
+        "JOIN APPLIB.CUSTMAST C ON O.CUSTNO = C.CUSTNO "
+        "WHERE O.AMOUNT > 0")
+    assert set(a.columns_used) == {
+        "APPLIB/ORDERS.ORDNO", "APPLIB/ORDERS.CUSTNO",
+        "APPLIB/CUSTMAST.CUSTNO", "APPLIB/ORDERS.AMOUNT"}
+    # The select list alone (column_lineage) does not carry the WHERE/JOIN
+    # columns — columns_used is a strict superset for this statement.
+    select_list_sources = {s for i in a.column_lineage for s in i["sources"]}
+    assert select_list_sources < set(a.columns_used)
+
+
+def test_columns_used_insert_select_covers_where_only_column():
+    a = analyze_statement(
+        "INSERT INTO ORDEXT (ORDNO, AMT) "
+        "SELECT ORDNO, AMOUNT FROM ORDERS WHERE AMOUNT > 0")
+    assert set(a.columns_used) == {"ORDERS.ORDNO", "ORDERS.AMOUNT"}
+
+
+def test_columns_used_update_single_table_default():
+    a = analyze_statement("UPDATE ORDERS SET AMOUNT = AMOUNT * 2 WHERE ORDNO = ?")
+    assert set(a.columns_used) == {"ORDERS.AMOUNT", "ORDERS.ORDNO"}
+
+
+def test_parse_all_fixture_estate_columns_used(parsed):
+    rows = parsed.execute(
+        "SELECT columns_used FROM parsed_sql_statements WHERE program = "
+        "'APPLIB/SQLEXT'").fetchall()
+    used = json.loads(rows[0][0])
+    assert set(used) == {"ORDERS.ORDNO", "ORDERS.AMOUNT"}
+
+
 def test_parse_all_fixture_estate(parsed):
     rows = parsed.execute(
         "SELECT program, stmt_type, tables_read, tables_written "

@@ -91,6 +91,16 @@ def test_cpyf_captured():
     info = json.loads(c.params[0])
     assert info["from_file"] == "ORDERS"
     assert info["to_file"] == "ORDARC"
+    assert info["fmtopt"] is None
+
+
+def test_cpyf_fmtopt_captured():
+    import json
+    p = _parse(
+        "             CPYF       FROMFILE(APPLIB/ORDERS) "
+        "TOFILE(APPLIB/ORDARC) MBROPT(*REPLACE) FMTOPT(*MAP *DROP)\n")
+    info = json.loads(p.calls[0].params[0])
+    assert info["fmtopt"] == "*MAP *DROP"
 
 
 def test_sbmjob_call_extracted():

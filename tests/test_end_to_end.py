@@ -18,7 +18,15 @@ def analyzed(built, config):
 def _bases(con, output_id):
     return {r[0] for r in con.execute(
         "SELECT DISTINCT source_file FROM output_lineage "
-        "WHERE output_id = ? AND source_column IS NULL",
+        "WHERE output_id = ? AND source_column IS NULL "
+        "AND relation = 'derives'",
+        [output_id]).fetchall()}
+
+
+def _used_columns(con, output_id):
+    return {r[0] for r in con.execute(
+        "SELECT DISTINCT source_column FROM output_lineage "
+        "WHERE output_id = ? AND relation = 'used'",
         [output_id]).fetchall()}
 
 
@@ -51,7 +59,8 @@ class TestColumnLevelLineage:
         con, _ = analyzed
         rows = {r[0] for r in con.execute(
             "SELECT source_column FROM output_lineage WHERE output_id = "
-            "'ORDER_EXTRACT' AND source_column IS NOT NULL").fetchall()}
+            "'ORDER_EXTRACT' AND source_column IS NOT NULL "
+            "AND relation = 'derives'").fetchall()}
         assert "column:APPLIB/ORDERS.ORDNO" in rows
         assert "column:APPLIB/ORDERS.AMOUNT" in rows
 
@@ -59,7 +68,8 @@ class TestColumnLevelLineage:
         con, _ = analyzed
         rows = {r[0] for r in con.execute(
             "SELECT source_column FROM output_lineage WHERE output_id = "
-            "'CUST_MONTHLY_RPT' AND source_column IS NOT NULL").fetchall()}
+            "'CUST_MONTHLY_RPT' AND source_column IS NOT NULL "
+            "AND relation = 'derives'").fetchall()}
         # CUSTRPT.CNAME -> CUSTLF1.CNAME (inferred) -> CUSTMAST.CUSTNAME (DDS
         # RENAME): the join-through-rename Phase 3 acceptance case.
         assert "column:APPLIB/CUSTMAST.CUSTNAME" in rows
@@ -69,9 +79,82 @@ class TestColumnLevelLineage:
         con, _ = analyzed
         conf = {r[0] for r in con.execute(
             "SELECT DISTINCT min_confidence FROM output_lineage WHERE "
-            "output_id = 'CUST_MONTHLY_RPT' AND source_column IS NOT NULL"
+            "output_id = 'CUST_MONTHLY_RPT' AND source_column IS NOT NULL "
+            "AND relation = 'derives'"
         ).fetchall()}
         assert "inferred" in conf
+
+
+class TestColumnUsage:
+    """Column usage from CL and RPG parsing: program -reads-> column,
+    relation='used' — "read en route", not "maps into the output"."""
+
+    def test_ordext_where_clause_column_used(self, analyzed):
+        con, _ = analyzed
+        # SQLEXT's INSERT ... SELECT ORDNO, AMOUNT FROM ORDERS WHERE
+        # AMOUNT > 0: both select-list and WHERE-only columns are usage.
+        used = _used_columns(con, "ORDER_EXTRACT")
+        assert used == {"column:APPLIB/ORDERS.ORDNO",
+                        "column:APPLIB/ORDERS.AMOUNT"}
+        confs = {r[0] for r in con.execute(
+            "SELECT DISTINCT min_confidence FROM output_lineage WHERE "
+            "output_id = 'ORDER_EXTRACT' AND relation = 'used'").fetchall()}
+        assert confs == {"parsed"}
+
+    def test_custrpt_chain_field_reference(self, analyzed):
+        con, _ = analyzed
+        # RPT001's CHAIN CUSTNO CUSTLF1 references CUSTNO by name. CUSTLF1
+        # itself is not a base physical file (it derives from CUSTMAST), so
+        # no usage row lands there; ORDHIST is the base file RPT001 actually
+        # reads (via CLDRIVER's OVRDBF ORDERS->ORDHIST) and does carry the
+        # parsed field reference.
+        used = _used_columns(con, "CUST_MONTHLY_RPT")
+        assert used == {"column:APPLIB/ORDHIST.CUSTNO"}
+        row = con.execute(
+            "SELECT min_confidence FROM output_lineage WHERE output_id = "
+            "'CUST_MONTHLY_RPT' AND relation = 'used'").fetchone()
+        assert row[0] == "parsed"
+
+    def test_ordsum_record_io_all_fields_fallback(self, analyzed):
+        con, _ = analyzed
+        # RPT002 reads ORDERS with no field-level evidence found in its
+        # C-specs (WRITEORDSREC references a record format, not a field) ->
+        # falls back to every ORDERS field, confidence inferred.
+        used = _used_columns(con, "ORDER_SUMMARY")
+        assert used == {
+            "column:APPLIB/ORDERS.ORDNO", "column:APPLIB/ORDERS.CUSTNO",
+            "column:APPLIB/ORDERS.AMOUNT", "column:APPLIB/ORDERS.ORDDATE"}
+        confs = {r[0] for r in con.execute(
+            "SELECT DISTINCT min_confidence FROM output_lineage WHERE "
+            "output_id = 'ORDER_SUMMARY' AND relation = 'used'").fetchall()}
+        assert confs == {"inferred"}
+
+    def test_used_rows_never_flip_coverage_status(self, analyzed, config):
+        """Usage rows are additive evidence, not lineage: they must not
+        change an output's resolved/partial/unresolved status (gaps.py
+        filters its confidence scan to relation='derives')."""
+        con, _ = analyzed
+        from lineage.analyze.gaps import coverage
+        cov = coverage(con, config)
+        assert cov["outputs"]["ORDER_EXTRACT"]["status"] == "resolved"
+
+    def test_commonality_matrix_has_column_rows(self, analyzed):
+        con, _ = analyzed
+        rows = {r[0] for r in con.execute(
+            "SELECT source_id FROM commonality_matrix WHERE output_id = "
+            "'ORDER_EXTRACT' AND source_id LIKE 'column:%'").fetchall()}
+        assert rows == {"column:APPLIB/ORDERS.ORDNO",
+                        "column:APPLIB/ORDERS.AMOUNT"}
+
+    def test_candidate_products_unaffected_by_columns(self, analyzed):
+        """candidate_products/greedy_cluster still operate on the file-level
+        matrix only — column rows must not change fan-out clustering."""
+        con, _ = analyzed
+        rows = con.execute(
+            "SELECT fanout, payload FROM product_candidates ORDER BY rank"
+        ).fetchall()
+        top = json.loads(rows[0][1])
+        assert top["shared_sources"] == ["file:APPLIB/ORDERS"]
 
 
 class TestGaps:
@@ -174,6 +257,9 @@ class TestReport:
         text = out.read_text()
         assert "CUST_MONTHLY_RPT" in text
         assert "replicate_as_view" in text
+        assert "Cols used" in text
+        assert "Top used source columns" in text
+        assert "APPLIB/ORDERS.AMOUNT" in text
 
     def test_parquet_export(self, analyzed, tmp_path):
         con, _ = analyzed

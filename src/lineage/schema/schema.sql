@@ -186,6 +186,15 @@ CREATE TABLE IF NOT EXISTS parsed_rpg_io_ops (
     direction      VARCHAR    -- read / write
 );
 
+CREATE TABLE IF NOT EXISTS parsed_rpg_field_refs (
+    -- Identifier tokens harvested from C-spec factor1/factor2/result areas
+    -- and O-spec field-entry areas — pure token harvesting, no opcode
+    -- semantics. Column usage is derived by intersecting these with a read
+    -- file's actual field set (raw_dspffd) in the graph build.
+    program        VARCHAR,
+    field_name     VARCHAR
+);
+
 CREATE TABLE IF NOT EXISTS parsed_sql_statements (
     program        VARCHAR,
     seq            INTEGER,
@@ -194,6 +203,9 @@ CREATE TABLE IF NOT EXISTS parsed_sql_statements (
     tables_read    VARCHAR,   -- JSON list of library/table
     tables_written VARCHAR,   -- JSON list
     column_lineage VARCHAR,   -- JSON: [{target, sources:[...]}]
+    columns_used   VARCHAR,   -- JSON list of every column referenced anywhere
+                               -- in the statement (select list, WHERE, JOIN
+                               -- ON, GROUP BY, ...), not just the select list
     parse_error    VARCHAR,   -- null when parsed cleanly
     raw_sql        VARCHAR
 );
@@ -235,7 +247,10 @@ CREATE TABLE IF NOT EXISTS output_lineage (
     source_file    VARCHAR,   -- base physical file node id
     source_column  VARCHAR,   -- nullable
     path_len       INTEGER,
-    min_confidence VARCHAR
+    min_confidence VARCHAR,
+    relation       VARCHAR DEFAULT 'derives'  -- 'derives' (maps into the
+                               -- output) | 'used' (read en route, e.g. a
+                               -- WHERE/CHAIN/CPYF-mapped column)
 );
 
 CREATE TABLE IF NOT EXISTS commonality_matrix (

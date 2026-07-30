@@ -1,4 +1,5 @@
 """Extraction-into-DuckDB and graph-build integration tests (no host)."""
+import json
 
 
 def test_extract_populates_raw_layer(extracted):
@@ -133,3 +134,115 @@ def test_view_column_lineage_from_catalog(built):
         "src LIKE 'column:APPLIB/CUSTVIEW%'").fetchall()
     assert ("column:APPLIB/CUSTVIEW.CNAME",
             "column:APPLIB/CUSTMAST.CUSTNAME") in rows
+
+
+# --- Column usage from CL and RPG parsing ------------------------------------
+
+def test_rpg_field_reference_usage_is_parsed(built):
+    """RPT001's CHAIN CUSTNO CUSTLF1 names CUSTNO explicitly: the resulting
+    usage edge is 'parsed', not the record-level fallback."""
+    con, _ = built
+    rows = con.execute(
+        "SELECT dst, confidence, context FROM edges WHERE "
+        "src = 'program:APPLIB/RPT001' AND kind = 'reads' AND "
+        "dst LIKE 'column:%'").fetchall()
+    by_dst = {d: (c, json.loads(ctx)) for d, c, ctx in rows}
+    assert by_dst["column:APPLIB/ORDHIST.CUSTNO"][0] == "parsed"
+    assert by_dst["column:APPLIB/ORDHIST.CUSTNO"][1]["mechanism"] == "field_reference"
+    # Only the referenced field, not every ORDHIST column.
+    ordhist_cols = {d for d in by_dst if d.startswith("column:APPLIB/ORDHIST.")}
+    assert ordhist_cols == {"column:APPLIB/ORDHIST.CUSTNO"}
+
+
+def test_override_resolved_target_gets_usage_edges(built):
+    """CLDRIVER overrides ORDERS -> ORDHIST around CALL RPT001: usage edges
+    must land on ORDHIST columns, never the superseded ORDERS ones."""
+    con, _ = built
+    dsts = {d for d, in con.execute(
+        "SELECT dst FROM edges WHERE src = 'program:APPLIB/RPT001' AND "
+        "kind = 'reads' AND dst LIKE 'column:%'").fetchall()}
+    assert any(d.startswith("column:APPLIB/ORDHIST.") for d in dsts)
+    assert not any(d.startswith("column:APPLIB/ORDERS.") for d in dsts)
+
+
+def test_rpg_record_io_all_fields_fallback_is_inferred(built):
+    """RPT002 has no field-level evidence for ORDERS (WRITEORDSREC names a
+    record format, not a field): falls back to every ORDERS field, marked
+    inferred, not parsed."""
+    con, _ = built
+    rows = con.execute(
+        "SELECT dst, confidence, context FROM edges WHERE "
+        "src = 'program:APPLIB/RPT002' AND kind = 'reads' AND "
+        "dst LIKE 'column:%'").fetchall()
+    assert rows  # sanity: some usage edges exist
+    for dst, conf, ctx in rows:
+        assert conf == "inferred"
+        assert json.loads(ctx)["mechanism"] == "record_io_all_fields"
+    assert {d for d, _, _ in rows} == {
+        "column:APPLIB/ORDERS.ORDNO", "column:APPLIB/ORDERS.CUSTNO",
+        "column:APPLIB/ORDERS.AMOUNT", "column:APPLIB/ORDERS.ORDDATE"}
+
+
+def test_sql_usage_edges_include_where_only_columns(built):
+    """SQLEXT's WHERE AMOUNT > 0 references AMOUNT even though it is also in
+    the select list; the usage edge exists regardless, distinct from the
+    select-list-only column_lineage derives_from edges."""
+    con, _ = built
+    dsts = {d for d, in con.execute(
+        "SELECT dst FROM edges WHERE src = 'program:APPLIB/SQLEXT' AND "
+        "kind = 'reads' AND provenance = 'source_sql' AND "
+        "dst LIKE 'column:%'").fetchall()}
+    assert dsts == {"column:APPLIB/ORDERS.ORDNO", "column:APPLIB/ORDERS.AMOUNT"}
+
+
+def test_cpyf_column_usage_default_is_inferred(built):
+    """CLDRIVER's CPYF FROMFILE(ORDERS) TOFILE(ORDARC) carries no FMTOPT:
+    the field-name intersection usage edges are 'inferred', not 'parsed'."""
+    con, _ = built
+    rows = con.execute(
+        "SELECT dst, confidence, context FROM edges WHERE "
+        "src = 'program:APPLIB/CLDRIVER' AND kind = 'reads' AND "
+        "provenance = 'source_cl' AND dst LIKE 'column:APPLIB/ORDERS.%'"
+    ).fetchall()
+    assert rows
+    for dst, conf, ctx in rows:
+        assert conf == "inferred"
+        assert json.loads(ctx)["mechanism"] == "cpyf_layout"
+
+
+def test_cpyf_fmtopt_map_raises_confidence_to_parsed(con, config):
+    """A CPYF with FMTOPT(*MAP) is confident field-name evidence: the usage
+    edges on the FROMFILE columns are 'parsed', mechanism 'cpyf_map'."""
+    import json as jsonmod
+    from lineage.db import insert_rows
+    from lineage.graph.build import build_graph
+
+    insert_rows(con, "raw_systables",
+                ["table_schema", "table_name", "system_name", "table_type"],
+                [("APPLIB", "SRCF", "SRCF", "P"),
+                 ("APPLIB", "TGTF", "TGTF", "P")])
+    insert_rows(con, "raw_dspffd",
+                ["file_lib", "file_name", "record_format", "field_name"],
+                [("APPLIB", "SRCF", "SRCFR", "FLDA"),
+                 ("APPLIB", "SRCF", "SRCFR", "FLDB"),
+                 ("APPLIB", "TGTF", "TGTFR", "FLDA"),
+                 ("APPLIB", "TGTF", "TGTFR", "FLDB")])
+    insert_rows(con, "parsed_cl_calls",
+                ["program", "seq", "called_lib", "called_pgm", "via",
+                 "params", "resolved", "expr"],
+                [("APPLIB/CLMAP", 1, None, None, "CPYF",
+                  jsonmod.dumps([jsonmod.dumps({
+                      "from_lib": "APPLIB", "from_file": "SRCF",
+                      "to_lib": "APPLIB", "to_file": "TGTF",
+                      "fmtopt": "*MAP *DROP"})]),
+                  True, None)])
+    g = build_graph(con, config, phase=3)
+    rows = con.execute(
+        "SELECT dst, confidence, context FROM edges WHERE "
+        "src = 'program:APPLIB/CLMAP' AND kind = 'reads' AND "
+        "dst LIKE 'column:APPLIB/SRCF.%'").fetchall()
+    assert {d for d, _, _ in rows} == {
+        "column:APPLIB/SRCF.FLDA", "column:APPLIB/SRCF.FLDB"}
+    for _, conf, ctx in rows:
+        assert conf == "parsed"
+        assert json.loads(ctx)["mechanism"] == "cpyf_map"

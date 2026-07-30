@@ -72,6 +72,15 @@ class SqlAnalysis:
     tables_read: list[str] = field(default_factory=list)
     tables_written: list[str] = field(default_factory=list)
     column_lineage: list[dict] = field(default_factory=list)  # {target, sources}
+    # Every column reference anywhere in the statement (select list, WHERE,
+    # JOIN ON, GROUP BY, SET expressions, ...) — a superset of
+    # column_lineage's sources, used for "this statement reads this column"
+    # usage edges rather than target-mapping lineage. For INSERT/UPDATE/MERGE
+    # this can include the statement's own target columns (e.g. an insert
+    # column list resolved as if they were reads); that is an acceptable
+    # over-report per the design doc, since it only ever maps a name that
+    # genuinely appears in the source text.
+    columns_used: list[str] = field(default_factory=list)
     ast_json: Optional[str] = None
     parse_error: Optional[str] = None
     is_dynamic: bool = False
@@ -287,6 +296,14 @@ def _analyze_tree(tree: exp.Expression) -> SqlAnalysis:
         # Fallback: any tables found count as reads.
         analysis.tables_read = real_tables(tree)
 
+    # Every column reference in the statement, not just the select-list /
+    # target mapping already captured in column_lineage. Unqualified columns
+    # default to the read tables when there is exactly one (falling back to
+    # the written table for single-table UPDATE/DELETE with no other read).
+    default_tables = analysis.tables_read or analysis.tables_written
+    analysis.columns_used = sorted(set(
+        _source_columns(tree, amap, default_tables)))
+
     return analysis
 
 
@@ -364,7 +381,8 @@ def parse_all(con) -> dict[str, int]:
             n_err += 1
         rows.append((program, seq, a.stmt_type, a.ast_json,
                      json.dumps(a.tables_read), json.dumps(a.tables_written),
-                     json.dumps(a.column_lineage), a.parse_error, raw_sql))
+                     json.dumps(a.column_lineage), json.dumps(a.columns_used),
+                     a.parse_error, raw_sql))
 
     # 2. RUNSQLSTM source members referenced from CL.
     members = {m.member.upper(): m for m in load_members(con)}
@@ -389,10 +407,12 @@ def parse_all(con) -> dict[str, int]:
             rows.append((f"{cl_program}#RUNSQLSTM:{mbr}", seq * 1000 + j,
                          a.stmt_type, a.ast_json,
                          json.dumps(a.tables_read), json.dumps(a.tables_written),
-                         json.dumps(a.column_lineage), a.parse_error, stmt))
+                         json.dumps(a.column_lineage), json.dumps(a.columns_used),
+                         a.parse_error, stmt))
 
     insert_rows(con, "parsed_sql_statements",
                 ["program", "seq", "stmt_type", "ast_json", "tables_read",
-                 "tables_written", "column_lineage", "parse_error", "raw_sql"],
+                 "tables_written", "column_lineage", "columns_used",
+                 "parse_error", "raw_sql"],
                 rows)
     return {"sql_statements": len(rows), "sql_parse_errors": n_err}

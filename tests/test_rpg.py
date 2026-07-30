@@ -134,6 +134,87 @@ def test_ispecs_ospecs_flags():
     assert p.has_ospecs
 
 
+def test_referenced_fields_from_factor1_and_factor2():
+    p = _parse3(
+        "     FCUSTLF1 IF  E                  DISK\n"
+        "     FORDERS  IF  E                  DISK\n"
+        "     C           CUSTNO    CHAINCUSTLF1                  91\n"
+    )
+    # Factor1 (CUSTNO) is harvested; factor2 (CUSTLF1) is a declared file
+    # name and excluded.
+    assert p.referenced_fields == {"CUSTNO"}
+
+
+def test_referenced_fields_exclude_indicators_and_figurative_constants():
+    p = _parse3(
+        "     FORDERS  IF  E                  DISK\n"
+        "     C           N90       SETONAMOUNT                   91\n"
+        "     C                     COMP      AMOUNT    *ZERO          91\n"
+    )
+    # Figurative constants (*ZERO) never surface as referenced fields; a
+    # genuine identifier (AMOUNT) does.
+    assert "AMOUNT" in p.referenced_fields
+    assert not any(f.startswith("*") for f in p.referenced_fields)
+
+
+def test_referenced_fields_result_area():
+    p = _parse3(
+        "     FORDERS  IF  E                  DISK\n"
+        "     C                     ADD  1         TOTAMT\n"
+    )
+    assert "TOTAMT" in p.referenced_fields
+
+
+def test_ospec_field_entry_harvested():
+    # Field-entry area is idx 31:43 — built by column position, not guessed
+    # spacing, to keep the fixed-format layout exact.
+    def ospec_line(field: str) -> str:
+        chars = [" "] * 48
+        chars[5] = "O"
+        for i, c in enumerate(field):
+            chars[31 + i] = c
+        return "".join(chars)
+
+    p = _parse3(
+        "     FCUSTRPT O   E                  DISK\n"
+        + ospec_line("CUSTNO") + "\n"
+        + ospec_line("AMOUNT") + "\n"
+    )
+    assert {"CUSTNO", "AMOUNT"} <= p.referenced_fields
+
+
+def test_referenced_fields_free_format():
+    p = _parse3(
+        "       DCL-F ORDERS USAGE(*INPUT);\n"
+        "       IF CUSTNO = 0;\n"
+        "         EVAL AMOUNT = AMOUNT + 1;\n"
+        "       ENDIF;\n",
+        mtype="RPGLE",
+    )
+    assert {"CUSTNO", "AMOUNT"} <= p.referenced_fields
+    # Declared file name and opcodes are not referenced fields.
+    assert "ORDERS" not in p.referenced_fields
+    assert "IF" not in p.referenced_fields
+    assert "EVAL" not in p.referenced_fields
+
+
+def test_referenced_fields_free_format_declaration_skipped():
+    p = _parse3(
+        "       DCL-S CUSTNO PACKED(9:2);\n",
+        mtype="RPGLE",
+    )
+    # A DCL-* line introduces a name, it does not reference an existing
+    # field — it must not contribute a referenced field.
+    assert "CUSTNO" not in p.referenced_fields
+
+
+def test_parse_all_fixture_estate_field_refs(parsed):
+    rows = {r[0] for r in parsed.execute(
+        "SELECT field_name FROM parsed_rpg_field_refs WHERE program = "
+        "'APPLIB/RPT001'").fetchall()}
+    assert "CUSTNO" in rows
+
+
 def test_parse_all_fixture_estate(parsed):
     rows = parsed.execute(
         "SELECT program, file, usage FROM parsed_rpg_files "

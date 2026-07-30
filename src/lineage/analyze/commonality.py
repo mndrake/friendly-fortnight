@@ -11,7 +11,15 @@ from typing import Callable
 
 
 def build_matrix(con) -> dict[str, set[str]]:
-    """output_id -> set of base source-file node ids (from output_lineage)."""
+    """output_id -> set of base source-file node ids (from output_lineage).
+
+    The returned dict stays file-level only — it feeds
+    ``candidate_products``/``greedy_cluster``, which cluster on shared base
+    files, not columns. Column-level incidence (relation='used' rows) is
+    written straight to ``commonality_matrix`` alongside the file rows, for
+    the "outputs x columns" view (commonality report / HTML), without
+    affecting the clustering input.
+    """
     con.execute("DELETE FROM commonality_matrix")
     rows = con.execute(
         "SELECT DISTINCT output_id, source_file FROM output_lineage "
@@ -19,10 +27,16 @@ def build_matrix(con) -> dict[str, set[str]]:
     matrix: dict[str, set[str]] = defaultdict(set)
     for output_id, source_file in rows:
         matrix[output_id].add(source_file)
+
+    col_rows = con.execute(
+        "SELECT DISTINCT output_id, source_column FROM output_lineage "
+        "WHERE relation = 'used' AND source_column IS NOT NULL").fetchall()
+
     from ..db import insert_rows
     insert_rows(con, "commonality_matrix",
                 ["output_id", "source_id", "present"],
-                [(o, s, True) for o, srcs in matrix.items() for s in sorted(srcs)])
+                [(o, s, True) for o, srcs in matrix.items() for s in sorted(srcs)]
+                + [(o, c, True) for o, c in col_rows])
     return dict(matrix)
 
 
