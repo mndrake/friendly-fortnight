@@ -149,9 +149,15 @@ def test_rpg_field_reference_usage_is_parsed(built):
     by_dst = {d: (c, json.loads(ctx)) for d, c, ctx in rows}
     assert by_dst["column:APPLIB/ORDHIST.CUSTNO"][0] == "parsed"
     assert by_dst["column:APPLIB/ORDHIST.CUSTNO"][1]["mechanism"] == "field_reference"
-    # Only the referenced field, not every ORDHIST column.
+    # The record's remaining fields keep the inferred record-level fallback
+    # (READ loads the whole record) — a partial intersection must not
+    # suppress them.
+    assert by_dst["column:APPLIB/ORDHIST.AMOUNT"][0] == "inferred"
+    assert by_dst["column:APPLIB/ORDHIST.AMOUNT"][1]["mechanism"] == \
+        "record_io_all_fields"
     ordhist_cols = {d for d in by_dst if d.startswith("column:APPLIB/ORDHIST.")}
-    assert ordhist_cols == {"column:APPLIB/ORDHIST.CUSTNO"}
+    assert ordhist_cols == {f"column:APPLIB/ORDHIST.{f}"
+                            for f in ("CUSTNO", "ORDNO", "AMOUNT", "ORDDATE")}
 
 
 def test_override_resolved_target_gets_usage_edges(built):

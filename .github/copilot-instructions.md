@@ -118,7 +118,12 @@ Rules that must hold:
   reference, CPYF FROMFILE∩TOFILE) — never RPG dataflow interpretation.
   `confidence=parsed` only when a real field name was seen in the source;
   `inferred` is the record-level fallback (every field of a file the program
-  reads, when no field-level evidence exists). `output_lineage.relation`
+  reads). RPG field references are program-wide, not per-file: RPG III
+  same-named fields across read files share one variable, so a referenced
+  name yields a `parsed` edge on *every* read file whose format carries it
+  (each file's column genuinely feeds the shared variable), and the
+  remaining fields of each read file always keep the `inferred` fallback —
+  a partial intersection must never suppress them. `output_lineage.relation`
   distinguishes the two views: `'derives'` (the pre-existing target-mapping
   rows) vs `'used'` (read en route to an output, not necessarily mapped into
   it) — `gaps.py::coverage` and the file-level commonality matrix stay scoped

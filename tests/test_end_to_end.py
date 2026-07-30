@@ -106,14 +106,22 @@ class TestColumnUsage:
         # RPT001's CHAIN CUSTNO CUSTLF1 references CUSTNO by name. CUSTLF1
         # itself is not a base physical file (it derives from CUSTMAST), so
         # no usage row lands there; ORDHIST is the base file RPT001 actually
-        # reads (via CLDRIVER's OVRDBF ORDERS->ORDHIST) and does carry the
-        # parsed field reference.
+        # reads (via CLDRIVER's OVRDBF ORDERS->ORDHIST). CUSTNO carries the
+        # parsed field reference (RPG III shared-variable semantics: READ
+        # ORDHIST loads its CUSTNO into the referenced variable), while the
+        # rest of the record keeps the inferred record-level fallback —
+        # ORDHIST's other genuinely-read columns must not be suppressed by
+        # the intersection.
         used = _used_columns(con, "CUST_MONTHLY_RPT")
-        assert used == {"column:APPLIB/ORDHIST.CUSTNO"}
-        row = con.execute(
-            "SELECT min_confidence FROM output_lineage WHERE output_id = "
-            "'CUST_MONTHLY_RPT' AND relation = 'used'").fetchone()
-        assert row[0] == "parsed"
+        assert used == {"column:APPLIB/ORDHIST.CUSTNO",
+                        "column:APPLIB/ORDHIST.ORDNO",
+                        "column:APPLIB/ORDHIST.AMOUNT",
+                        "column:APPLIB/ORDHIST.ORDDATE"}
+        conf = dict(con.execute(
+            "SELECT source_column, min_confidence FROM output_lineage WHERE "
+            "output_id = 'CUST_MONTHLY_RPT' AND relation = 'used'").fetchall())
+        assert conf["column:APPLIB/ORDHIST.CUSTNO"] == "parsed"
+        assert conf["column:APPLIB/ORDHIST.AMOUNT"] == "inferred"
 
     def test_ordsum_record_io_all_fields_fallback(self, analyzed):
         con, _ = analyzed

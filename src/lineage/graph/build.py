@@ -682,21 +682,27 @@ class GraphBuilder:
                 fields = ffd.get(((lib or "").upper(), (tf or "").upper()), set())
                 if not fields:
                     continue
+                # Field references are harvested program-wide: RPG III
+                # same-named fields across read files share one variable, so
+                # a referenced name present in this file's format means this
+                # file's column genuinely feeds that variable (parsed) — even
+                # when the reference was coded against another file. The
+                # record's remaining fields are still loaded by every READ/
+                # CHAIN, so they keep the inferred record-level fallback
+                # rather than being suppressed by the intersection.
                 used = fields & program_refs
-                if used:
-                    for f in sorted(used):
-                        self.add_edge(Edge(
-                            src=pid, dst=column_id(lib, tf, f),
-                            kind=EdgeKind.READS, provenance=Provenance.SOURCE_RPG,
-                            confidence=Confidence.PARSED,
-                            context={"mechanism": "field_reference"}))
-                else:
-                    for f in sorted(fields):
-                        self.add_edge(Edge(
-                            src=pid, dst=column_id(lib, tf, f),
-                            kind=EdgeKind.READS, provenance=Provenance.SOURCE_RPG,
-                            confidence=Confidence.INFERRED,
-                            context={"mechanism": "record_io_all_fields"}))
+                for f in sorted(used):
+                    self.add_edge(Edge(
+                        src=pid, dst=column_id(lib, tf, f),
+                        kind=EdgeKind.READS, provenance=Provenance.SOURCE_RPG,
+                        confidence=Confidence.PARSED,
+                        context={"mechanism": "field_reference"}))
+                for f in sorted(fields - used):
+                    self.add_edge(Edge(
+                        src=pid, dst=column_id(lib, tf, f),
+                        kind=EdgeKind.READS, provenance=Provenance.SOURCE_RPG,
+                        confidence=Confidence.INFERRED,
+                        context={"mechanism": "record_io_all_fields"}))
 
     def _sql_column_usage_edges(self) -> None:
         rows = self.con.execute(
