@@ -239,11 +239,14 @@ def test_realistic_host_pgmref_dbr_ffd_harvest_maps_correctly():
     con.close()
 
 
-def test_old_style_ncnt_required_field_fails_against_real_probe():
-    """Sanity check that the realistic-host probe genuinely reproduces the
-    live bug: a layout that (like the old hardcoded code) treats ``WHNCNT``
-    as *required* fails against the true QWHDRPPR column set — proving the
-    realistic-host fixture above would have caught the original SQL0206."""
+def test_required_whncnt_style_layout_fails_at_resolve_time():
+    """A layout that (like the old hardcoded code) demands ``WHNCNT`` now
+    fails client-side at resolve time against the true QWHDRPPR column set —
+    the failure mode that previously surfaced only as a host SQL0206 is
+    caught before any SQL is sent. (The old code's actual SQL0206 against
+    the realistic host is exercised by `_RealisticHostSession`'s SQL-column
+    validation in the harvest tests above, which rejects any generated
+    select referencing an unprobed column.)"""
     from lineage.extract import xref as xref_mod
 
     broken = xref_mod.OutfileLayout(
@@ -254,6 +257,24 @@ def test_old_style_ncnt_required_field_fails_against_real_probe():
     session = _realistic_session()
     with pytest.raises(OutfileShapeError, match="WHNCNT"):
         xref_mod._select_outfile(session, "QTEMP", "PGMREF", broken)
+
+
+def test_full_mode_multi_library_probes_each_layout_once(con, session):
+    """harvest() shares one resolution cache across its per-library loop:
+    three libraries must still yield exactly three probes (one per outfile
+    layout), not nine."""
+    from lineage.config import from_dict
+    from lineage.extract import xref as xref_mod
+
+    config3 = from_dict({
+        "scratch_lib": "QTEMP",
+        "libraries": ["APPLIB", "LIBB", "LIBC"],
+        "output_seeds": [{"id": "X", "library": "APPLIB", "file": "CUSTRPT"}],
+        "liblists": {"default": ["APPLIB"]},
+    })
+    xref_mod.harvest(session, con, config3)
+    probes = [q for q in session.sql_log if q.startswith("SELECT * FROM")]
+    assert len(probes) == 3
 
 
 # --- Probe-once caching over per-file mode ------------------------------------

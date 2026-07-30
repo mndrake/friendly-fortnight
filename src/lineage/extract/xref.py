@@ -244,7 +244,9 @@ DBR_COLUMNS = ["dep_lib", "dep_file", "based_lib", "based_file", "dep_type"]
 
 def harvest_pgmref(session: HostSession, con, config,
                    scratch_lib: str | None = None,
-                   libraries: "Sequence[str] | None" = None) -> dict[str, int]:
+                   libraries: "Sequence[str] | None" = None,
+                   resolution_cache: dict[str, str] | None = None
+                   ) -> dict[str, int]:
     """DSPPGMREF PGM(lib/*ALL) per library — full-scope, always.
 
     ``libraries`` defaults to the configured scan list; :func:`harvest` passes
@@ -254,7 +256,8 @@ def harvest_pgmref(session: HostSession, con, config,
 
     scratch = scratch_lib or config.scratch_lib
     counts = {"raw_dsppgmref": 0}
-    resolution_cache: dict[str, str] = {}
+    if resolution_cache is None:
+        resolution_cache = {}
     for lib in (config.libraries if libraries is None else libraries):
         pgm_of = f"{scratch}/PGMREF"
         session.run_cl(
@@ -270,7 +273,9 @@ def harvest_pgmref(session: HostSession, con, config,
 def harvest_ffd(session: HostSession, con, config,
                 files: "Sequence[tuple[str, str]] | None" = None,
                 scratch_lib: str | None = None,
-                libraries: "Sequence[str] | None" = None) -> dict[str, int]:
+                libraries: "Sequence[str] | None" = None,
+                resolution_cache: dict[str, str] | None = None
+                ) -> dict[str, int]:
     """DSPFFD outfile harvest.
 
     ``files=None`` (default) reproduces today's behavior: one
@@ -289,7 +294,8 @@ def harvest_ffd(session: HostSession, con, config,
 
     scratch = scratch_lib or config.scratch_lib
     counts = {"raw_dspffd": 0}
-    resolution_cache: dict[str, str] = {}
+    if resolution_cache is None:
+        resolution_cache = {}
     if files is None:
         for lib in (config.libraries if libraries is None else libraries):
             ffd_of = f"{scratch}/FFD"
@@ -323,7 +329,9 @@ def harvest_ffd(session: HostSession, con, config,
 def harvest_dbr(session: HostSession, con, config,
                 files: "Sequence[tuple[str, str]] | None" = None,
                 scratch_lib: str | None = None,
-                libraries: "Sequence[str] | None" = None) -> dict[str, int]:
+                libraries: "Sequence[str] | None" = None,
+                resolution_cache: dict[str, str] | None = None
+                ) -> dict[str, int]:
     """DSPDBR outfile harvest — dependent (logical) -> based-on (physical).
 
     Same ``files=None`` vs. per-file scoping and dedup/filter rules as
@@ -333,7 +341,8 @@ def harvest_dbr(session: HostSession, con, config,
 
     scratch = scratch_lib or config.scratch_lib
     counts = {"raw_dspdbr": 0}
-    resolution_cache: dict[str, str] = {}
+    if resolution_cache is None:
+        resolution_cache = {}
     if files is None:
         for lib in (config.libraries if libraries is None else libraries):
             dbr_of = f"{scratch}/DBR"
@@ -382,17 +391,21 @@ def harvest(session: HostSession, con, config, scratch_lib: str | None = None) -
     with a ``files`` scope.
     """
     counts = {"raw_dsppgmref": 0, "raw_dspffd": 0, "raw_dspdbr": 0}
+    # One layout-resolution cache for the whole run: the outfile shapes are
+    # host-defined and identical across libraries, so each layout is probed
+    # once, not once per library.
+    cache: dict[str, str] = {}
     # Per library, PGMREF -> FFD -> DBR — the exact command order of the
     # original single-function harvest, so full mode stays byte-identical
     # on multi-library configs.
     for lib in config.libraries:
         for sub in (
             harvest_pgmref(session, con, config, scratch_lib=scratch_lib,
-                           libraries=[lib]),
+                           libraries=[lib], resolution_cache=cache),
             harvest_ffd(session, con, config, scratch_lib=scratch_lib,
-                        libraries=[lib]),
+                        libraries=[lib], resolution_cache=cache),
             harvest_dbr(session, con, config, scratch_lib=scratch_lib,
-                        libraries=[lib]),
+                        libraries=[lib], resolution_cache=cache),
         ):
             for k, v in sub.items():
                 counts[k] += v

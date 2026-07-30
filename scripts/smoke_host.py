@@ -76,16 +76,16 @@ def main() -> int:
             print(f"[3] DSPPGMREF layout ok ({len(r.rows)} sample rows)")
 
         # 4. Source member round-trip via the configured retrieval strategy
-        #    (ifs_read needs QSYS2.IFS_READ: IBM i 7.3 TR7 / 7.4+).
+        #    (ifs_read needs QSYS2.IFS_READ: IBM i 7.3 TR7 / 7.4+). Member
+        #    enumeration goes through the profile-adaptive path — the member
+        #    column is TABLE_PARTITION on current releases, PARTITION_NAME
+        #    on others; never hardcode either.
         if cfg.source_files:
-            from lineage.extract.source import retrieve_member
+            from lineage.extract.source import enumerate_members, retrieve_member
             src = cfg.source_files[0]
-            r = session.query(
-                "SELECT PARTITION_NAME FROM QSYS2.SYSPARTITIONSTAT "
-                f"WHERE TABLE_SCHEMA = '{src.library}' AND "
-                f"TABLE_NAME = '{src.file}' FETCH FIRST 1 ROWS ONLY")
-            if r.rows:
-                member = r.rows[0][0].strip()
+            members = enumerate_members(session, src, prof)
+            if members:
+                member = (members[0].get("member") or "").strip()
                 lines, strategy = retrieve_member(session, src, member, cfg)
                 text = " ".join(t for _, t in lines[:5])
                 printable = sum(1 for ch in text if ch.isprintable())
