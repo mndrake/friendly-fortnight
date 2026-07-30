@@ -26,7 +26,7 @@ from typing import Any
 
 from ..config import Config, SourceFileRef
 from ..db import insert_rows
-from .connection import HostSession, QueryResult
+from .connection import HostError, HostSession, QueryResult
 from .hostinfo import HostProfile
 
 
@@ -132,14 +132,37 @@ def retrieve_member_ifs(session: HostSession, src: SourceFileRef,
 
 def retrieve_member_alias(session: HostSession, src: SourceFileRef,
                           member: str, scratch_lib: str) -> list[tuple[int, str]]:
-    """Read a member via a temporary alias in the scratch library."""
+    """Read a member via a temporary alias in the scratch library.
+
+    The create is retried once (drop-then-recreate, defensive against a
+    leftover alias in the same job) before giving up on it; the first
+    create error is kept for diagnostics if the retry also fails. If the
+    SELECT itself then fails, the two failures are combined into one rich
+    ``HostError`` — the swallowed-CREATE-error bug that produced an
+    inscrutable downstream SQL0204 on a live IBM i 7.5 run must not repeat.
+    """
     alias = f"{scratch_lib}.T_MBR"
-    _create_alias(session, alias, src, member)
+    create_error = _create_alias(session, alias, src, member)
+    if create_error is not None:
+        _drop_alias(session, alias)
+        retry_error = _create_alias(session, alias, src, member)
+        if retry_error is None:
+            create_error = None
     try:
         res = _fetch(
             session, f"source.text.{src.library}.{src.file}.{member}",
             f"SELECT SRCSEQ, SRCDTA FROM {alias} ORDER BY SRCSEQ",
         )
+    except Exception as exc:  # noqa: BLE001 - re-raised below with full context
+        ref = f"{src.library}/{src.file}({member})"
+        create_msg = (str(create_error) if create_error is not None
+                      else "create reported success")
+        raise HostError(
+            f"failed to retrieve member {ref} via alias: SELECT failed "
+            f"({exc}); CREATE ALIAS failed ({create_msg}); run "
+            "SELECT * FROM TABLE(QSYS2.JOBLOG_INFO('*')) immediately after "
+            "for host-side detail"
+        ) from exc
     finally:
         _drop_alias(session, alias)
     return _rows_to_lines(res)
@@ -155,12 +178,15 @@ def _rows_to_lines(res: QueryResult) -> list[tuple[int, str]]:
 
 
 def _create_alias(session: HostSession, alias: str, src: SourceFileRef,
-                  member: str) -> None:
+                  member: str) -> Exception | None:
+    """Issue the CREATE ALIAS; return the exception (or ``None``) instead of
+    swallowing it, so callers can diagnose and/or retry."""
     stmt = f"CREATE ALIAS {alias} FOR {src.library}.{src.file}({member})"
     try:
         session.query(stmt)
-    except Exception:  # noqa: BLE001 - fixtures don't need the alias
-        pass
+    except Exception as exc:  # noqa: BLE001 - caller decides how to react
+        return exc
+    return None
 
 
 def _drop_alias(session: HostSession, alias: str) -> None:
@@ -173,15 +199,25 @@ def _drop_alias(session: HostSession, alias: str) -> None:
 
 def harvest(session: HostSession, con, config: Config,
             profile: HostProfile | None = None) -> dict[str, int]:
-    """Enumerate and retrieve every member of every configured source file."""
+    """Enumerate and retrieve every member of every configured source file.
+
+    One bad member (e.g. an alias that genuinely cannot be created/read on
+    this release) must never crash a run over thousands of members — its
+    retrieval failure is counted and the harvest continues.
+    """
     rows: list[tuple[Any, ...]] = []
     fallbacks = 0
+    retrieval_failures = 0
     for src in config.source_files:
         for m in enumerate_members(session, src, profile):
             member = m["member"]
             member_type = m.get("member_type")
-            lines, strategy = retrieve_member(session, src, member, config,
-                                              profile)
+            try:
+                lines, strategy = retrieve_member(session, src, member,
+                                                  config, profile)
+            except Exception:  # noqa: BLE001 - counted, not fatal
+                retrieval_failures += 1
+                continue
             if strategy == "alias_fallback":
                 fallbacks += 1
             for seq, text in lines:
@@ -196,6 +232,8 @@ def harvest(session: HostSession, con, config: Config,
         # Members IFS_READ could not open in text mode (data-PF source files
         # or CCSID 65535); the alias strategy served them instead.
         counts["ifs_read_fallbacks"] = fallbacks
+    if retrieval_failures:
+        counts["member_retrieval_failures"] = retrieval_failures
     return counts
 
 

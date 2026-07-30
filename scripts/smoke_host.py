@@ -86,21 +86,30 @@ def main() -> int:
             members = enumerate_members(session, src, prof)
             if members:
                 member = (members[0].get("member") or "").strip()
-                lines, strategy = retrieve_member(session, src, member, cfg)
-                text = " ".join(t for _, t in lines[:5])
-                printable = sum(1 for ch in text if ch.isprintable())
-                if text and printable / max(len(text), 1) > 0.9:
-                    print(f"[4] source round-trip ok ({src.qualified}/"
-                          f"{member}, strategy={strategy})")
-                    if strategy == "alias_fallback":
-                        print("    note: IFS_READ returned no rows for this "
-                              "member (data-PF source file or SRCDTA CCSID "
-                              "65535?) — alias fallback was used")
-                else:
-                    print(f"[4] source text empty or garbled "
-                          f"(strategy={strategy}) — check member contents, "
-                          "CCSID, and QSYS2.JOBLOG_INFO('*') for the "
-                          "underlying IFS_READ message")
+                try:
+                    lines, strategy = retrieve_member(session, src, member, cfg)
+                    text = " ".join(t for _, t in lines[:5])
+                    printable = sum(1 for ch in text if ch.isprintable())
+                    if text and printable / max(len(text), 1) > 0.9:
+                        print(f"[4] source round-trip ok ({src.qualified}/"
+                              f"{member}, strategy={strategy})")
+                        if strategy == "alias_fallback":
+                            print("    note: IFS_READ returned no rows for "
+                                  "this member (data-PF source file or "
+                                  "SRCDTA CCSID 65535?) — alias fallback "
+                                  "was used")
+                    else:
+                        print(f"[4] source text empty or garbled "
+                              f"(strategy={strategy}) — check member "
+                              "contents, CCSID, and QSYS2.JOBLOG_INFO('*') "
+                              "for the underlying IFS_READ message")
+                        ok = False
+                except Exception as exc:  # noqa: BLE001 - smoke reports, never crashes
+                    print(f"[4] source round-trip FAILED for "
+                          f"{src.qualified}/{member}:")
+                    print(f"    {exc}")
+                    print("    run SELECT * FROM TABLE(QSYS2.JOBLOG_INFO('*')) "
+                          "immediately after for host-side detail")
                     ok = False
             else:
                 print(f"[4] no members in {src.qualified}, skipped")
