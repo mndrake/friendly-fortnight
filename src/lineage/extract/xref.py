@@ -169,8 +169,13 @@ def usage_directions(flag: str | None) -> tuple[str, ...]:
 
 
 def _row_map(result: QueryResult, layout: OutfileLayout) -> list[dict[str, Any]]:
-    """Validate that the query returned our raw columns, return list of dicts."""
-    missing = [c for c in layout.raw_columns if c not in result.columns]
+    """Validate that the query returned our raw columns, return list of dicts.
+
+    Comparison is case-insensitive: the live JDBC driver reports our
+    ``AS raw_column`` aliases folded to uppercase.
+    """
+    returned = {c.lower() for c in result.columns}
+    missing = [c for c in layout.raw_columns if c.lower() not in returned]
     if missing:
         raise ValueError(
             f"{layout.name}: outfile query is missing expected columns {missing}; "

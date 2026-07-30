@@ -62,7 +62,9 @@ def enumerate_members(session: HostSession, src: SourceFileRef,
         WHERE TABLE_SCHEMA = '{src.library}' AND TABLE_NAME = '{src.file}'
         """,
     )
-    return res.dicts()
+    # An empty member name would build nonsense downstream (an alias like
+    # FILE() is an SQL0104) — drop such rows rather than propagate them.
+    return [m for m in res.dicts() if (m.get("member") or "").strip()]
 
 
 def ifs_member_path(src: SourceFileRef, member: str) -> str:

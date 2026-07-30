@@ -59,3 +59,14 @@ def test_usage_directions():
     # unknown/blank defaults to read (safe direction)
     assert usage_directions("") == ("reads",)
     assert usage_directions(None) == ("reads",)
+
+
+def test_pgmref_mapping_accepts_uppercase_jdbc_labels():
+    """Live JDBC folds our `AS program_lib` aliases to uppercase; mapping
+    must match case-insensitively instead of reporting them missing."""
+    res = QueryResult(
+        columns=[c.upper() for c in PGMREF_LAYOUT.raw_columns],
+        rows=[("APPLIB", "RPT001", "APPLIB", "ORDERS", "F", "1", None)],
+    )
+    assert map_pgmref(res) == [
+        ("APPLIB", "RPT001", "APPLIB", "ORDERS", "F", "1", None)]

@@ -311,3 +311,38 @@ def test_harvest_counts_one_bad_member_and_keeps_the_good_one(con):
     rows = con.execute(
         "SELECT member, line_text FROM raw_source_members").fetchall()
     assert rows == [("GOODMBR", "GOOD LINE")]
+
+
+# --- Live JDBC label case: aliases come back uppercased -----------------------
+
+
+class _UppercaseLabelSession:
+    """Live-host shape: DB2 folds unquoted `AS member` aliases to uppercase,
+    so result columns arrive as MEMBER/MEMBER_TYPE — unlike fixtures."""
+
+    def __init__(self):
+        self.sql_log = []
+
+    def query(self, sql, params=()):
+        self.sql_log.append(sql)
+        if "SYSPARTITIONSTAT" in sql:
+            return QueryResult(columns=["MEMBER", "MEMBER_TYPE"],
+                               rows=[("BROAST", "SQL"), ("  ", None)])
+        return QueryResult(columns=[], rows=[])
+
+    def run_cl(self, command):  # pragma: no cover - unused
+        pass
+
+    def close(self):  # pragma: no cover - unused
+        pass
+
+
+def test_enumerate_members_handles_uppercase_jdbc_labels():
+    """The live-host bug: `.get("member")` returned None because the driver
+    labeled the column MEMBER, yielding an empty member name and a
+    CREATE ALIAS ...FILE() SQL0104. Keys are now case-normalised, and rows
+    with blank member names are dropped."""
+    from lineage.extract.source import enumerate_members
+
+    members = enumerate_members(_UppercaseLabelSession(), SRC)
+    assert members == [{"member": "BROAST", "member_type": "SQL"}]

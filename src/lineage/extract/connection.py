@@ -23,7 +23,15 @@ class QueryResult:
     rows: list[tuple[Any, ...]]
 
     def dicts(self) -> list[dict[str, Any]]:
-        return [dict(zip(self.columns, r)) for r in self.rows]
+        """Rows as dicts with **lowercased** keys.
+
+        DB2 for i folds unquoted column aliases to uppercase, so a live JDBC
+        result labels ``SELECT x AS member`` as ``MEMBER`` while fixtures use
+        the lowercase alias verbatim — consumers key by the lowercase name
+        and must see the same shape from both.
+        """
+        keys = [c.lower() for c in self.columns]
+        return [dict(zip(keys, r)) for r in self.rows]
 
 
 @runtime_checkable
