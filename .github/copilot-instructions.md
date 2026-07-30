@@ -55,8 +55,15 @@ Rules that must hold:
   targeted mode (still required, validated at `extract` time, for
   `extraction_scope: full`).
 - Outfile record layouts (DSPPGMREF/DSPDBR/DSPFFD in `extract/xref.py`) are
-  mapped **by field name, never by position**; a missing field must raise,
-  not shift columns.
+  mapped **by field name, never by position**, the same adaptive way QSYS2
+  catalog columns are (see below): each field declares an ordered candidate
+  list of model-file column names (e.g. DSPFFD's field name is `WHFLDI` on
+  some releases, `WHFLDE` on others; DSPPGMREF has no ref-count field at
+  all) plus a required flag, resolved against the outfile's *actual*
+  columns probed at run time (`SELECT * ... FETCH FIRST 1 ROWS ONLY`) —
+  never a hardcoded, unverified list. Missing optional fields NULL-fill; a
+  missing required field raises `OutfileShapeError` naming the outfile and
+  listing its actual columns, rather than shifting columns.
 - QSYS2 catalog SELECTs are **capability-driven**, never hardcoded: the host
   probe (`extract/hostinfo.py`, run at the start of `extract` and by
   `lineage probe`) records the DB2/OS version (JDBC `DatabaseMetaData` +

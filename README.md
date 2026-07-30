@@ -68,8 +68,12 @@ For live-host extraction include the `host` extra (jaydebeapi/JPype):
    across releases, missing optional columns are NULL-filled, and a missing
    required column fails with an explicit message instead of a generic
    column-not-found error. `uv run python scripts/smoke_host.py config.yaml`
-   additionally checks QCMDEXC, the DSPPGMREF outfile column layout, and a
-   source-member CCSID round-trip. `uv run lineage profile` measures
+   additionally checks QCMDEXC and a source-member CCSID round-trip; for the
+   DSPPGMREF outfile it probes the outfile's actual columns, resolves our
+   candidate field-name layout against them, and prints the per-field
+   mapping (candidate columns used, any NULL-filled optionals) — a required
+   field with no match fails the smoke run with the outfile's actual column
+   list. `uv run lineage profile` measures
    catalog/source volumes and bottlenecks read-only (`QSYS2.OBJECT_STATISTICS`
    and catalog-view aggregates only, no CL, no DDL) and writes
    `data/profile_report.json` with recommendations on whether targeted

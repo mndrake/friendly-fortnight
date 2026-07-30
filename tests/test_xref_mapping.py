@@ -59,9 +59,3 @@ def test_usage_directions():
     # unknown/blank defaults to read (safe direction)
     assert usage_directions("") == ("reads",)
     assert usage_directions(None) == ("reads",)
-
-
-def test_select_list_aliases_every_field():
-    sql = PGMREF_LAYOUT.select_list()
-    for fld, col in PGMREF_LAYOUT.fields:
-        assert f"{fld} AS {col}" in sql

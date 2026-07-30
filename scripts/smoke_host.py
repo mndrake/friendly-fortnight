@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from lineage.config import load_config  # noqa: E402
 from lineage.extract.connection import open_session  # noqa: E402
-from lineage.extract.xref import PGMREF_LAYOUT  # noqa: E402
+from lineage.extract.xref import OutfileShapeError, PGMREF_LAYOUT  # noqa: E402
 
 
 def main() -> int:
@@ -48,20 +48,31 @@ def main() -> int:
         session.run_cl(f"CHKOBJ OBJ({cfg.libraries[0]}) OBJTYPE(*LIB)")
         print("[2] QCMDEXC: CHKOBJ ok")
 
-        # 3. DSPPGMREF outfile layout.
+        # 3. DSPPGMREF outfile layout: probe the outfile's actual columns,
+        #    resolve our candidate-name layout against them, print the
+        #    per-field mapping, then pull a few sample rows through it.
         of = f"{cfg.scratch_lib}/SMOKEPR"
         session.run_cl(
             f"DSPPGMREF PGM({cfg.libraries[0]}/*ALL) OUTPUT(*OUTFILE) "
             f"OUTFILE({of})")
-        r = session.query(
-            f"SELECT {PGMREF_LAYOUT.select_list()} FROM "
-            f"{cfg.scratch_lib}.SMOKEPR FETCH FIRST 5 ROWS ONLY")
-        missing = [c for c in PGMREF_LAYOUT.raw_columns if c.upper() not in
-                   {x.upper() for x in r.columns}]
-        if missing:
-            print(f"[3] DSPPGMREF layout MISMATCH, missing: {missing}")
+        probe = session.query(
+            f"SELECT * FROM {cfg.scratch_lib}.SMOKEPR FETCH FIRST 1 ROWS ONLY")
+        try:
+            select_list, missing_optional = PGMREF_LAYOUT.resolve(probe.columns)
+        except OutfileShapeError as exc:
+            print(f"[3] DSPPGMREF layout MISMATCH: {exc}")
             ok = False
         else:
+            print(f"[3] DSPPGMREF layout resolved against actual columns "
+                  f"{probe.columns}:")
+            for part in select_list.split(", "):
+                actual, _, raw = part.rpartition(" AS ")
+                shown = "NULL (optional, no candidate matched)" \
+                    if raw in missing_optional else actual
+                print(f"    {raw} <- {shown}")
+            r = session.query(
+                f"SELECT {select_list} FROM {cfg.scratch_lib}.SMOKEPR "
+                f"FETCH FIRST 5 ROWS ONLY")
             print(f"[3] DSPPGMREF layout ok ({len(r.rows)} sample rows)")
 
         # 4. Source member round-trip via the configured retrieval strategy

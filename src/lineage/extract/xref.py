@@ -3,10 +3,15 @@
 These ``DSP*`` commands write to database outfiles whose record layouts are
 IBM-defined model files (``QADSPPGM``/``QWHDRPPR``, ``QADSPDBR``/``QWHDRDBR``,
 ``QADSPFFD``/``QWHDRFFD``). We map those layouts by **field name, never by
-position**: each map below lists the outfile fields we select and the raw
-column they land in. If a target release renames or omits a field, the SELECT
-fails loudly rather than silently shifting columns — verify against
-``DSPFFD FILE(QSYS/QADSPPGM)`` on the target system.
+position**, the same adaptive way ``extract/catalog.py`` maps QSYS2 catalog
+views: each field we want declares an ordered list of candidate model-file
+column names (a target release may rename or drop one — e.g. field name is
+``WHFLDI``/``WHFLDE`` depending on release, and DSPPGMREF has no ``WHNCNT``
+ref-count field at all) plus a required flag. The candidate list is resolved
+against the outfile's *actual* columns, probed at run time
+(:func:`_select_outfile`) — never a hardcoded, unverified list. A required
+field with no matching candidate fails loudly (:class:`OutfileShapeError`)
+rather than silently shifting columns.
 
 The mapping functions (``map_*``) are pure and unit-tested against fixture
 rows; orchestration (``harvest``) is the only part that touches the host.
@@ -21,73 +26,125 @@ from .connection import HostSession, QueryResult
 
 @dataclass(frozen=True)
 class OutfileLayout:
-    """One outfile field layout: model file/format and the field->column map."""
+    """One outfile record layout: model file/format and its field candidates.
+
+    ``fields`` entries are ``(raw_column, candidates, required)``: ``raw_column``
+    is the stable name downstream code reads (matches ``map_*``/``*_COLUMNS``),
+    ``candidates`` is an ordered tuple of model-file column names to try. The
+    field's own ``raw_column`` is implicitly tried last, after every declared
+    candidate — the identity rule that lets a source already exposing our raw
+    names (:class:`~.connection.FixtureHostSession`) resolve unchanged.
+    """
 
     name: str
     model_file: str      # e.g. QSYS/QADSPPGM
     record_format: str   # e.g. QWHDRPPR
-    # ordered: outfile field name -> our raw column name
-    fields: tuple[tuple[str, str], ...]
-
-    @property
-    def outfile_fields(self) -> tuple[str, ...]:
-        return tuple(f for f, _ in self.fields)
+    fields: tuple[tuple[str, tuple[str, ...], bool], ...]
 
     @property
     def raw_columns(self) -> tuple[str, ...]:
-        return tuple(c for _, c in self.fields)
+        return tuple(raw for raw, _cands, _req in self.fields)
 
-    def select_list(self) -> str:
-        # Alias each outfile field to its raw column so downstream code reads
-        # by our stable names regardless of the model field name.
-        return ", ".join(f"{fld} AS {col}" for fld, col in self.fields)
+    def resolve(self, actual_columns: Sequence[str]) -> tuple[str, list[str]]:
+        """Resolve this layout against an outfile's actual columns.
+
+        Returns ``(select_list_sql, missing_optional_raw_columns)``. Matching
+        is case-insensitive. Missing optional fields NULL-fill
+        (``CAST(NULL AS VARCHAR(1)) AS <raw>``); a missing required field
+        raises :class:`OutfileShapeError`.
+        """
+        available = {c.upper(): c for c in actual_columns}
+        parts: list[str] = []
+        missing: list[str] = []
+        for raw, candidates, required in self.fields:
+            tried = list(candidates) + [raw]  # identity rule: implicit last try
+            picked = next((available[c.upper()] for c in tried
+                          if c.upper() in available), None)
+            if picked is None:
+                if required:
+                    raise OutfileShapeError(self, raw, tried, actual_columns)
+                missing.append(raw)
+                parts.append(f"CAST(NULL AS VARCHAR(1)) AS {raw}")
+            else:
+                parts.append(f"{picked} AS {raw}")
+        return ", ".join(parts), missing
+
+
+class OutfileShapeError(RuntimeError):
+    """A required outfile field has no matching column on this release."""
+
+    def __init__(self, layout: OutfileLayout, raw_column: str,
+                candidates_tried: Sequence[str], actual_columns: Sequence[str]):
+        super().__init__(
+            f"{layout.model_file} ({layout.record_format}) outfile for "
+            f"'{layout.name}' has none of the candidate columns "
+            f"{tuple(candidates_tried)} needed for '{raw_column}'. Actual "
+            f"columns: {sorted(actual_columns)}. Update the candidate list "
+            f"in extract/xref.py for this release."
+        )
+        self.layout = layout
+        self.raw_column = raw_column
+        self.candidates_tried = tuple(candidates_tried)
+        self.actual_columns = tuple(actual_columns)
 
 
 # --- DSPPGMREF: program -> referenced object (compiled references) -----------
+# QSYS/QADSPPGM (record format QWHDRPPR) documented fields: WHLIB, WHPNAM,
+# WHTEXT, WHFNUM, WHDTTM, WHFNAM, WHLNAM, WHSNAM, WHRFNO, WHFUSG, WHRFNM,
+# WHRFSN, WHRFFN, WHOBJT (1-char object type), WHOTYP (10-char object type),
+# WHSYSN, WHSPKG. There is no ref-count field (WHNCNT was invented).
 PGMREF_LAYOUT = OutfileLayout(
     name="dsppgmref",
     model_file="QSYS/QADSPPGM",
     record_format="QWHDRPPR",
     fields=(
-        ("WHLIB", "program_lib"),
-        ("WHPNAM", "program_name"),
-        ("WHLNAM", "object_lib"),
-        ("WHFNAM", "object_name"),
-        ("WHOTYP", "object_type"),
-        ("WHFUSG", "usage_flag"),
-        ("WHNCNT", "ref_count"),
+        ("program_lib", ("WHLIB",), True),
+        ("program_name", ("WHPNAM",), True),
+        ("object_lib", ("WHLNAM",), True),
+        ("object_name", ("WHFNAM",), True),
+        ("object_type", ("WHOTYP", "WHOBJT"), True),
+        ("usage_flag", ("WHFUSG",), True),
+        # Not a documented QWHDRPPR field; kept for raw-schema compat, always
+        # NULL-filled on a real host.
+        ("ref_count", ("WHNCNT",), False),
     ),
 )
 
 # --- DSPDBR: dependent (logical) -> based-on (physical) ----------------------
+# QSYS/QADSPDBR (record format QWHDRDBR): the file the command was run
+# against (based-on) is WHRFI/WHRLI; the dependent (logical) file is
+# WHREFI/WHRELI.
 DBR_LAYOUT = OutfileLayout(
     name="dspdbr",
     model_file="QSYS/QADSPDBR",
     record_format="QWHDRDBR",
     fields=(
-        ("WHRELI", "dep_lib"),
-        ("WHREFI", "dep_file"),
-        ("WHLIB", "based_lib"),
-        ("WHFILE", "based_file"),
-        ("WHRTYP", "dep_type"),
+        ("dep_lib", ("WHRELI",), True),
+        ("dep_file", ("WHREFI",), True),
+        ("based_lib", ("WHRLI", "WHLIB"), True),
+        ("based_file", ("WHRFI", "WHFILE"), True),
+        ("dep_type", ("WHRTYP", "WHTYPE"), False),
     ),
 )
 
 # --- DSPFFD: field descriptions per file/record format -----------------------
+# QSYS/QADSPFFD (record format QWHDRFFD): field name exists as both WHFLDI
+# (internal) and WHFLDE (external); WHFLDN ordinal is undocumented, so it and
+# the rest of the descriptive fields are optional/candidate-based.
 FFD_LAYOUT = OutfileLayout(
     name="dspffd",
     model_file="QSYS/QADSPFFD",
     record_format="QWHDRFFD",
     fields=(
-        ("WHLIB", "file_lib"),
-        ("WHFILE", "file_name"),
-        ("WHNAME", "record_format"),
-        ("WHFLDE", "field_name"),
-        ("WHFLDT", "field_type"),
-        ("WHFLDB", "field_length"),
-        ("WHFLDP", "field_scale"),
-        ("WHFTXT", "field_text"),
-        ("WHFLDN", "field_ordinal"),
+        ("file_lib", ("WHLIB",), True),
+        ("file_name", ("WHFILE",), True),
+        ("record_format", ("WHNAME",), True),
+        ("field_name", ("WHFLDI", "WHFLDE"), True),
+        ("field_type", ("WHFLDT",), False),
+        ("field_length", ("WHFLDB",), False),
+        ("field_scale", ("WHFLDP", "WHFLDD"), False),
+        ("field_text", ("WHFTXT",), False),
+        ("field_ordinal", ("WHFLDN", "WHFOBO"), False),
     ),
 )
 
@@ -197,12 +254,14 @@ def harvest_pgmref(session: HostSession, con, config,
 
     scratch = scratch_lib or config.scratch_lib
     counts = {"raw_dsppgmref": 0}
+    resolution_cache: dict[str, str] = {}
     for lib in (config.libraries if libraries is None else libraries):
         pgm_of = f"{scratch}/PGMREF"
         session.run_cl(
             f"DSPPGMREF PGM({lib}/*ALL) OUTPUT(*OUTFILE) OUTFILE({pgm_of})"
         )
-        res = _select_outfile(session, scratch, "PGMREF", PGMREF_LAYOUT)
+        res = _select_outfile(session, scratch, "PGMREF", PGMREF_LAYOUT,
+                              resolution_cache)
         counts["raw_dsppgmref"] += insert_rows(
             con, "raw_dsppgmref", PGMREF_COLUMNS, map_pgmref(res))
     return counts
@@ -230,13 +289,15 @@ def harvest_ffd(session: HostSession, con, config,
 
     scratch = scratch_lib or config.scratch_lib
     counts = {"raw_dspffd": 0}
+    resolution_cache: dict[str, str] = {}
     if files is None:
         for lib in (config.libraries if libraries is None else libraries):
             ffd_of = f"{scratch}/FFD"
             session.run_cl(
                 f"DSPFFD FILE({lib}/*ALL) OUTPUT(*OUTFILE) OUTFILE({ffd_of})"
             )
-            res = _select_outfile(session, scratch, "FFD", FFD_LAYOUT)
+            res = _select_outfile(session, scratch, "FFD", FFD_LAYOUT,
+                                  resolution_cache)
             counts["raw_dspffd"] += insert_rows(
                 con, "raw_dspffd", FFD_COLUMNS, map_ffd(res))
         return counts
@@ -250,7 +311,8 @@ def harvest_ffd(session: HostSession, con, config,
         session.run_cl(
             f"DSPFFD FILE({lib}/{file}) OUTPUT(*OUTFILE) OUTFILE({ffd_of})"
         )
-        res = _select_outfile(session, scratch, "FFD", FFD_LAYOUT)
+        res = _select_outfile(session, scratch, "FFD", FFD_LAYOUT,
+                              resolution_cache)
         rows = [r for r in map_ffd(res)
                 if ((r[0] or "").upper(), (r[1] or "").upper()) == key]
         counts["raw_dspffd"] += insert_rows(con, "raw_dspffd", FFD_COLUMNS, rows)
@@ -271,13 +333,15 @@ def harvest_dbr(session: HostSession, con, config,
 
     scratch = scratch_lib or config.scratch_lib
     counts = {"raw_dspdbr": 0}
+    resolution_cache: dict[str, str] = {}
     if files is None:
         for lib in (config.libraries if libraries is None else libraries):
             dbr_of = f"{scratch}/DBR"
             session.run_cl(
                 f"DSPDBR FILE({lib}/*ALL) OUTPUT(*OUTFILE) OUTFILE({dbr_of})"
             )
-            res = _select_outfile(session, scratch, "DBR", DBR_LAYOUT)
+            res = _select_outfile(session, scratch, "DBR", DBR_LAYOUT,
+                                  resolution_cache)
             counts["raw_dspdbr"] += insert_rows(
                 con, "raw_dspdbr", DBR_COLUMNS, map_dbr(res))
         return counts
@@ -291,7 +355,8 @@ def harvest_dbr(session: HostSession, con, config,
         session.run_cl(
             f"DSPDBR FILE({lib}/{file}) OUTPUT(*OUTFILE) OUTFILE({dbr_of})"
         )
-        res = _select_outfile(session, scratch, "DBR", DBR_LAYOUT)
+        res = _select_outfile(session, scratch, "DBR", DBR_LAYOUT,
+                              resolution_cache)
         rows = [r for r in map_dbr(res)
                 if ((r[0] or "").upper(), (r[1] or "").upper()) == key]
         counts["raw_dspdbr"] += insert_rows(con, "raw_dspdbr", DBR_COLUMNS, rows)
@@ -335,10 +400,32 @@ def harvest(session: HostSession, con, config, scratch_lib: str | None = None) -
 
 
 def _select_outfile(session: HostSession, scratch: str, name: str,
-                    layout: OutfileLayout) -> QueryResult:
-    sql = f"SELECT {layout.select_list()} FROM {scratch}.{name}"
+                    layout: OutfileLayout,
+                    resolution_cache: dict[str, str] | None = None
+                    ) -> QueryResult:
+    """Probe the outfile's actual columns, resolve the layout, then select.
+
+    The probe (``SELECT * ... FETCH FIRST 1 ROWS ONLY``) and the data select
+    both go through the same fixture tag (``with_tag`` applied to each query
+    individually — :class:`~.connection.FixtureHostSession` consumes the tag
+    once per call). ``resolution_cache``, when given, is keyed by
+    ``layout.name`` and shared across a whole ``harvest_*`` call so per-file
+    mode (many DSPFFD/DSPDBR invocations) probes once, not once per file.
+    """
     tag = f"xref.{layout.name}"
-    # FixtureHostSession honours with_tag; real sessions ignore it.
-    if hasattr(session, "with_tag"):
-        return session.with_tag(tag).query(sql)
-    return session.query(sql)
+
+    def _query(sql: str) -> QueryResult:
+        # FixtureHostSession honours with_tag; real sessions ignore it.
+        if hasattr(session, "with_tag"):
+            return session.with_tag(tag).query(sql)
+        return session.query(sql)
+
+    if resolution_cache is not None and layout.name in resolution_cache:
+        select_list = resolution_cache[layout.name]
+    else:
+        probe = _query(f"SELECT * FROM {scratch}.{name} FETCH FIRST 1 ROWS ONLY")
+        select_list, _missing = layout.resolve(probe.columns)
+        if resolution_cache is not None:
+            resolution_cache[layout.name] = select_list
+
+    return _query(f"SELECT {select_list} FROM {scratch}.{name}")
