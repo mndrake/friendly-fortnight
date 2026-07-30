@@ -18,6 +18,7 @@ from typing import Optional, Sequence
 from ..db import insert_rows
 from .connection import HostSession, QueryResult
 from .hostinfo import HostProfile
+from .progress import NULL, Progress
 
 
 @dataclass(frozen=True)
@@ -220,7 +221,8 @@ def _fetch(session: HostSession, tag: str, sql: str) -> QueryResult:
 
 def harvest(session: HostSession, con, config,
             profile: HostProfile | None = None,
-            only: dict[str, Sequence[tuple[str, str]]] | None = None
+            only: dict[str, Sequence[tuple[str, str]]] | None = None,
+            progress: Progress | None = None
             ) -> dict[str, int]:
     """Pull the QSYS2 catalog views into the raw store.
 
@@ -231,6 +233,7 @@ def harvest(session: HostSession, con, config,
     (0 rows) rather than issuing an unfiltered pull; views not named in
     ``only`` behave exactly as a full-mode pull (today's behavior).
     """
+    p = progress or NULL
     libs = _in_list(config.libraries)
     counts: dict[str, int] = {}
     for spec in PULLS:
@@ -262,6 +265,7 @@ def harvest(session: HostSession, con, config,
                 continue
             rows: list[tuple] = []
             missing: list[str] = []
+            p.start(f"catalog {spec.name} ({len(todo)} pairs)")
             for frag in pairs_filter(spec.schema_filter, "TABLE_NAME", todo):
                 # No TABLE_SCHEMA IN (...) conjunct here: the pairs already
                 # pin exact (schema, name) scope, so a slice object in a
@@ -278,12 +282,16 @@ def harvest(session: HostSession, con, config,
                 counts[f"{spec.name}_missing_columns"] = len(missing)
             counts[spec.raw_table] = insert_rows(
                 con, spec.raw_table, RAW_COLUMNS[spec.raw_table], rows)
+            p.done(f"catalog {spec.name} ({len(todo)} pairs)",
+                   rows=counts[spec.raw_table])
             continue
         sql, missing = spec.build_select(available, libs)
         if missing:
             counts[f"{spec.name}_missing_columns"] = len(missing)
+        p.start(f"catalog {spec.name}")
         res = _fetch(session, f"catalog.{spec.name}", sql)
         counts[spec.raw_table] = insert_rows(
             con, spec.raw_table, RAW_COLUMNS[spec.raw_table],
             [tuple(r) for r in res.rows])
+        p.done(f"catalog {spec.name}", rows=counts[spec.raw_table])
     return counts

@@ -628,3 +628,152 @@ def test_mid_round_discovery_waits_for_objstat_no_decoy_fetch():
         "name='HELPER'").fetchone()[0]
     assert src_ref == "TESTLIB/QCLSRC(HELPERSRC)"
     con.close()
+
+
+# --- Per-file failure tolerance: phantom libraries must not kill a run --------
+
+class _PhantomLibSession(FixtureHostSession):
+    """Fixture session whose CL commands fail (CPF3064) for given libraries —
+    the live-host failure mode where slice discovery names a library that
+    does not actually exist on the system."""
+
+    def __init__(self, responses, fail_libs):
+        super().__init__(responses=responses)
+        self._fail_libs = set(fail_libs)
+
+    def run_cl(self, command: str) -> None:
+        super().run_cl(command)
+        for lib in self._fail_libs:
+            if f"({lib}/" in command:
+                from lineage.extract.connection import HostError
+                raise HostError(f"[CPF3064] Library {lib} not found.")
+
+
+def _ffd_result(rows) -> QueryResult:
+    return QueryResult(
+        columns=["file_lib", "file_name", "record_format", "field_name",
+                 "field_type", "field_length", "field_scale", "field_text",
+                 "field_ordinal"], rows=rows)
+
+
+def test_perfile_ffd_skips_phantom_library_and_caches_it():
+    """One CPF3064 marks the library dead: its remaining files are counted
+    as failures without further host calls, and good files still harvest."""
+    from lineage.extract import xref
+
+    session = _PhantomLibSession(
+        {"xref.dspffd": _ffd_result([
+            ("GOODLIB", "F1", "REC", "FLD1", "A", "10", None, "t", "1"),
+            ("GOODLIB", "F4", "REC", "FLD4", "A", "10", None, "t", "1")])},
+        fail_libs={"IMA91G001"})
+    con = dbmod.connect(None)
+    files = [("GOODLIB", "F1"), ("IMA91G001", "F2"),
+             ("IMA91G001", "F3"), ("GOODLIB", "F4")]
+    counts = xref.harvest_ffd(session, con, _synthetic_config(), files=files)
+
+    assert counts["raw_dspffd"] == 2
+    assert counts["raw_dspffd_failures"] == 2
+    # The dead-library cache: exactly one attempted command against the
+    # phantom library, not one per file.
+    assert sum(1 for c in session.cl_log if "IMA91G001" in c) == 1
+    got = set(con.execute(
+        "SELECT file_lib, file_name FROM raw_dspffd").fetchall())
+    assert got == {("GOODLIB", "F1"), ("GOODLIB", "F4")}
+    con.close()
+
+
+def test_perfile_dbr_generic_failure_does_not_condemn_the_library():
+    """A non-CPF3064 per-file failure is skipped and counted, but the same
+    library's other files are still attempted."""
+    from lineage.extract import xref
+    from lineage.extract.connection import HostError
+
+    class _OneBadFile(FixtureHostSession):
+        def run_cl(self, command: str) -> None:
+            super().run_cl(command)
+            if "(LIB1/BADF)" in command:
+                raise HostError("[CPF9860] Some other per-file error.")
+
+    session = _OneBadFile(responses={"xref.dspdbr": QueryResult(
+        columns=["dep_lib", "dep_file", "based_lib", "based_file", "dep_type"],
+        rows=[("LIB1", "GOODF", "LIB1", "BASE", "D")])})
+    con = dbmod.connect(None)
+    counts = xref.harvest_dbr(session, con, _synthetic_config(),
+                              files=[("LIB1", "BADF"), ("LIB1", "GOODF")])
+
+    assert counts["raw_dspdbr_failures"] == 1
+    assert counts["raw_dspdbr"] == 1
+    assert any("(LIB1/GOODF)" in c for c in session.cl_log)
+    con.close()
+
+
+def test_targeted_survives_phantom_discovered_library():
+    """End-to-end regression for the live CPF3064 crash: a slice-discovered
+    library that doesn't exist must not abort harvest_targeted — failures
+    are counted, the audit trail keeps the file, and the run completes."""
+    from lineage.extract import targeted
+
+    session = _PhantomLibSession(_otherlib_responses(),
+                                 fail_libs={"OTHERLIB"})
+    con = dbmod.connect(None)
+    counts = targeted.harvest_targeted(session, con, _synthetic_config())
+
+    assert counts.get("xref.raw_dspffd_failures", 0) >= 1
+    assert counts.get("xref.raw_dspdbr_failures", 0) >= 1
+    sl = _slice_rows(con)
+    assert ("file", "OTHERLIB", "EXTFILE") in sl   # audited despite failure
+    con.close()
+
+
+# --- Progress reporting -------------------------------------------------------
+
+def test_targeted_emits_progress_phases(config, session):
+    from lineage.extract import hostinfo, targeted
+    from lineage.extract.progress import Progress
+
+    con = dbmod.connect(None)
+    profile = hostinfo.probe(session)
+    out: list[str] = []
+    targeted.harvest_targeted(session, con, config, profile,
+                              progress=Progress(echo=out.append))
+    text = "\n".join(out)
+    assert "== seed pass" in text
+    assert "== slice computation" in text
+    assert "== round 1" in text
+    assert "DSPPGMREF APPLIB/*ALL" in text
+    assert any(ln.strip().startswith("round 1:") for ln in out)
+    con.close()
+
+
+def test_targeted_without_progress_is_unchanged(config, session):
+    """The progress parameter defaults to a no-op — same counts either way."""
+    import conftest as conftest_mod
+    from lineage.extract import hostinfo, targeted
+    from lineage.extract.progress import Progress
+
+    con1 = dbmod.connect(None)
+    profile = hostinfo.probe(session)
+    c1 = targeted.harvest_targeted(session, con1, config, profile)
+    con2 = dbmod.connect(None)
+    session2 = conftest_mod.build_session()
+    c2 = targeted.harvest_targeted(session2, con2, config,
+                                   hostinfo.probe(session2),
+                                   progress=Progress(echo=lambda s: None))
+    assert c1 == c2
+    con1.close()
+    con2.close()
+
+
+def test_full_mode_progress_lines(config, session, con):
+    from lineage.extract import hostinfo, source, xref
+    from lineage.extract.progress import Progress
+
+    out: list[str] = []
+    prog = Progress(echo=out.append)
+    profile = hostinfo.probe(session)
+    xref.harvest(session, con, config, progress=prog)
+    source.harvest(session, con, config, profile, progress=prog)
+    text = "\n".join(out)
+    assert "DSPPGMREF APPLIB/*ALL ..." in text
+    assert "DSPFFD APPLIB/*ALL: done in" in text
+    assert "source APPLIB/QCLSRC: done in" in text

@@ -28,6 +28,7 @@ from ..config import Config, SourceFileRef
 from ..db import insert_rows
 from .connection import HostError, HostSession, QueryResult
 from .hostinfo import HostProfile
+from .progress import NULL, Progress
 
 
 def _fetch(session: HostSession, tag: str, sql: str) -> QueryResult:
@@ -200,18 +201,24 @@ def _drop_alias(session: HostSession, alias: str) -> None:
 
 
 def harvest(session: HostSession, con, config: Config,
-            profile: HostProfile | None = None) -> dict[str, int]:
+            profile: HostProfile | None = None,
+            progress: Progress | None = None) -> dict[str, int]:
     """Enumerate and retrieve every member of every configured source file.
 
     One bad member (e.g. an alias that genuinely cannot be created/read on
     this release) must never crash a run over thousands of members — its
     retrieval failure is counted and the harvest continues.
     """
+    p = progress or NULL
     rows: list[tuple[Any, ...]] = []
     fallbacks = 0
     retrieval_failures = 0
     for src in config.source_files:
-        for m in enumerate_members(session, src, profile):
+        members = enumerate_members(session, src, profile)
+        label = f"source {src.library}/{src.file}"
+        p.start(label)
+        file_fallbacks = file_failures = 0
+        for i, m in enumerate(members, start=1):
             member = m["member"]
             member_type = m.get("member_type")
             try:
@@ -219,11 +226,17 @@ def harvest(session: HostSession, con, config: Config,
                                                   config, profile)
             except Exception:  # noqa: BLE001 - counted, not fatal
                 retrieval_failures += 1
+                file_failures += 1
+                p.tick(f"members {src.library}/{src.file}", i, len(members))
                 continue
             if strategy == "alias_fallback":
                 fallbacks += 1
+                file_fallbacks += 1
             for seq, text in lines:
                 rows.append((src.library, src.file, member, member_type, seq, text))
+            p.tick(f"members {src.library}/{src.file}", i, len(members))
+        p.done(label, members=len(members), fallbacks=file_fallbacks,
+               failures=file_failures)
     inserted = insert_rows(
         con, "raw_source_members",
         ["library", "srcfile", "member", "member_type", "seq", "line_text"],

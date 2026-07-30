@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from .connection import HostSession, QueryResult
+from .progress import NULL, Progress
 
 
 @dataclass(frozen=True)
@@ -250,7 +251,8 @@ DBR_COLUMNS = ["dep_lib", "dep_file", "based_lib", "based_file", "dep_type"]
 def harvest_pgmref(session: HostSession, con, config,
                    scratch_lib: str | None = None,
                    libraries: "Sequence[str] | None" = None,
-                   resolution_cache: dict[str, str] | None = None
+                   resolution_cache: dict[str, str] | None = None,
+                   progress: Progress | None = None
                    ) -> dict[str, int]:
     """DSPPGMREF PGM(lib/*ALL) per library — full-scope, always.
 
@@ -259,27 +261,49 @@ def harvest_pgmref(session: HostSession, con, config,
     """
     from ..db import insert_rows
 
+    p = progress or NULL
     scratch = scratch_lib or config.scratch_lib
     counts = {"raw_dsppgmref": 0}
     if resolution_cache is None:
         resolution_cache = {}
     for lib in (config.libraries if libraries is None else libraries):
         pgm_of = f"{scratch}/PGMREF"
+        p.start(f"DSPPGMREF {lib}/*ALL")
         session.run_cl(
             f"DSPPGMREF PGM({lib}/*ALL) OUTPUT(*OUTFILE) OUTFILE({pgm_of})"
         )
         res = _select_outfile(session, scratch, "PGMREF", PGMREF_LAYOUT,
                               resolution_cache)
-        counts["raw_dsppgmref"] += insert_rows(
+        inserted = insert_rows(
             con, "raw_dsppgmref", PGMREF_COLUMNS, map_pgmref(res))
+        counts["raw_dsppgmref"] += inserted
+        p.done(f"DSPPGMREF {lib}/*ALL", rows=inserted)
     return counts
+
+
+def _is_missing_library(exc: Exception) -> bool:
+    """A per-file DSP command failed because the *library* does not exist.
+
+    CPF3064 ("Library &1 not found") reaches us wrapped in a JDBC
+    SQLException whose text carries the message id; CPF9810 is the same
+    condition from other commands. When a whole library is dead, every file
+    under it will fail identically — the caller caches the library and skips
+    its remaining files instead of paying one failed host call each.
+    """
+    msg = str(exc).upper()
+    return "CPF3064" in msg or "CPF9810" in msg
+
+
+def _first_line(exc: Exception) -> str:
+    return str(exc).strip().splitlines()[0] if str(exc).strip() else repr(exc)
 
 
 def harvest_ffd(session: HostSession, con, config,
                 files: "Sequence[tuple[str, str]] | None" = None,
                 scratch_lib: str | None = None,
                 libraries: "Sequence[str] | None" = None,
-                resolution_cache: dict[str, str] | None = None
+                resolution_cache: dict[str, str] | None = None,
+                progress: Progress | None = None
                 ) -> dict[str, int]:
     """DSPFFD outfile harvest.
 
@@ -294,9 +318,18 @@ def harvest_ffd(session: HostSession, con, config,
     select, so without filtering this would insert duplicates. Pairs whose
     (library, file) already have rows in ``raw_dspffd`` are skipped, so
     repeat calls across rounds don't duplicate either.
+
+    A per-file command failure (a slice-discovered library that doesn't
+    actually exist — CPF3064 — or a file the profile can't describe) is
+    counted and skipped, never fatal: the slice is *discovered* from parsed
+    source and compiled references, so it can name phantom objects, and one
+    of them must not kill a long extraction. Dead libraries are cached so a
+    phantom library costs one failed host call, not one per file under it.
+    The affected file surfaces downstream as a missing-columns gap.
     """
     from ..db import insert_rows
 
+    p = progress or NULL
     scratch = scratch_lib or config.scratch_lib
     counts = {"raw_dspffd": 0}
     if resolution_cache is None:
@@ -304,30 +337,55 @@ def harvest_ffd(session: HostSession, con, config,
     if files is None:
         for lib in (config.libraries if libraries is None else libraries):
             ffd_of = f"{scratch}/FFD"
+            p.start(f"DSPFFD {lib}/*ALL")
             session.run_cl(
                 f"DSPFFD FILE({lib}/*ALL) OUTPUT(*OUTFILE) OUTFILE({ffd_of})"
             )
             res = _select_outfile(session, scratch, "FFD", FFD_LAYOUT,
                                   resolution_cache)
-            counts["raw_dspffd"] += insert_rows(
+            inserted = insert_rows(
                 con, "raw_dspffd", FFD_COLUMNS, map_ffd(res))
+            counts["raw_dspffd"] += inserted
+            p.done(f"DSPFFD {lib}/*ALL", rows=inserted)
         return counts
 
     already = _harvested_pairs(con, "raw_dspffd", "file_lib", "file_name")
-    for lib, file in files:
+    dead_libs: set[str] = set()
+    failures = 0
+    total = len(files)
+    for i, (lib, file) in enumerate(files, start=1):
+        p.tick("DSPFFD per-file", i, total)
         key = (lib.upper(), file.upper())
         if key in already:
             continue
+        if key[0] in dead_libs:
+            failures += 1
+            continue
         ffd_of = f"{scratch}/FFD"
-        session.run_cl(
-            f"DSPFFD FILE({lib}/{file}) OUTPUT(*OUTFILE) OUTFILE({ffd_of})"
-        )
-        res = _select_outfile(session, scratch, "FFD", FFD_LAYOUT,
-                              resolution_cache)
+        try:
+            session.run_cl(
+                f"DSPFFD FILE({lib}/{file}) OUTPUT(*OUTFILE) OUTFILE({ffd_of})"
+            )
+            res = _select_outfile(session, scratch, "FFD", FFD_LAYOUT,
+                                  resolution_cache)
+        except OutfileShapeError:
+            raise   # a layout mismatch is systemic, not per-file — fail loudly
+        except Exception as exc:  # noqa: BLE001 - counted, never fatal
+            failures += 1
+            if _is_missing_library(exc):
+                dead_libs.add(key[0])
+                p.note(f"DSPFFD {lib}/{file} failed ({_first_line(exc)}) — "
+                       f"library {lib} marked dead, skipping its other files")
+            else:
+                p.note(f"DSPFFD {lib}/{file} failed ({_first_line(exc)}) — "
+                       "skipped")
+            continue
         rows = [r for r in map_ffd(res)
                 if ((r[0] or "").upper(), (r[1] or "").upper()) == key]
         counts["raw_dspffd"] += insert_rows(con, "raw_dspffd", FFD_COLUMNS, rows)
         already.add(key)
+    if failures:
+        counts["raw_dspffd_failures"] = failures
     return counts
 
 
@@ -335,15 +393,18 @@ def harvest_dbr(session: HostSession, con, config,
                 files: "Sequence[tuple[str, str]] | None" = None,
                 scratch_lib: str | None = None,
                 libraries: "Sequence[str] | None" = None,
-                resolution_cache: dict[str, str] | None = None
+                resolution_cache: dict[str, str] | None = None,
+                progress: Progress | None = None
                 ) -> dict[str, int]:
     """DSPDBR outfile harvest — dependent (logical) -> based-on (physical).
 
-    Same ``files=None`` vs. per-file scoping and dedup/filter rules as
+    Same ``files=None`` vs. per-file scoping, dedup/filter rules, and
+    per-file failure tolerance (dead-library cache included) as
     :func:`harvest_ffd`, filtered on the *dependent* (library, file).
     """
     from ..db import insert_rows
 
+    p = progress or NULL
     scratch = scratch_lib or config.scratch_lib
     counts = {"raw_dspdbr": 0}
     if resolution_cache is None:
@@ -351,30 +412,55 @@ def harvest_dbr(session: HostSession, con, config,
     if files is None:
         for lib in (config.libraries if libraries is None else libraries):
             dbr_of = f"{scratch}/DBR"
+            p.start(f"DSPDBR {lib}/*ALL")
             session.run_cl(
                 f"DSPDBR FILE({lib}/*ALL) OUTPUT(*OUTFILE) OUTFILE({dbr_of})"
             )
             res = _select_outfile(session, scratch, "DBR", DBR_LAYOUT,
                                   resolution_cache)
-            counts["raw_dspdbr"] += insert_rows(
+            inserted = insert_rows(
                 con, "raw_dspdbr", DBR_COLUMNS, map_dbr(res))
+            counts["raw_dspdbr"] += inserted
+            p.done(f"DSPDBR {lib}/*ALL", rows=inserted)
         return counts
 
     already = _harvested_pairs(con, "raw_dspdbr", "dep_lib", "dep_file")
-    for lib, file in files:
+    dead_libs: set[str] = set()
+    failures = 0
+    total = len(files)
+    for i, (lib, file) in enumerate(files, start=1):
+        p.tick("DSPDBR per-file", i, total)
         key = (lib.upper(), file.upper())
         if key in already:
             continue
+        if key[0] in dead_libs:
+            failures += 1
+            continue
         dbr_of = f"{scratch}/DBR"
-        session.run_cl(
-            f"DSPDBR FILE({lib}/{file}) OUTPUT(*OUTFILE) OUTFILE({dbr_of})"
-        )
-        res = _select_outfile(session, scratch, "DBR", DBR_LAYOUT,
-                              resolution_cache)
+        try:
+            session.run_cl(
+                f"DSPDBR FILE({lib}/{file}) OUTPUT(*OUTFILE) OUTFILE({dbr_of})"
+            )
+            res = _select_outfile(session, scratch, "DBR", DBR_LAYOUT,
+                                  resolution_cache)
+        except OutfileShapeError:
+            raise   # a layout mismatch is systemic, not per-file — fail loudly
+        except Exception as exc:  # noqa: BLE001 - counted, never fatal
+            failures += 1
+            if _is_missing_library(exc):
+                dead_libs.add(key[0])
+                p.note(f"DSPDBR {lib}/{file} failed ({_first_line(exc)}) — "
+                       f"library {lib} marked dead, skipping its other files")
+            else:
+                p.note(f"DSPDBR {lib}/{file} failed ({_first_line(exc)}) — "
+                       "skipped")
+            continue
         rows = [r for r in map_dbr(res)
                 if ((r[0] or "").upper(), (r[1] or "").upper()) == key]
         counts["raw_dspdbr"] += insert_rows(con, "raw_dspdbr", DBR_COLUMNS, rows)
         already.add(key)
+    if failures:
+        counts["raw_dspdbr_failures"] = failures
     return counts
 
 
@@ -385,7 +471,8 @@ def _harvested_pairs(con, table: str, lib_col: str, name_col: str
     return {((lib or "").upper(), (name or "").upper()) for lib, name in rows}
 
 
-def harvest(session: HostSession, con, config, scratch_lib: str | None = None) -> dict[str, int]:
+def harvest(session: HostSession, con, config, scratch_lib: str | None = None,
+            progress: Progress | None = None) -> dict[str, int]:
     """Full-mode wrapper: DSPPGMREF/DSPFFD/DSPDBR *ALL per configured library.
 
     Returns a dict of raw table -> rows inserted. This (and the three
@@ -406,14 +493,17 @@ def harvest(session: HostSession, con, config, scratch_lib: str | None = None) -
     for lib in config.libraries:
         for sub in (
             harvest_pgmref(session, con, config, scratch_lib=scratch_lib,
-                           libraries=[lib], resolution_cache=cache),
+                           libraries=[lib], resolution_cache=cache,
+                           progress=progress),
             harvest_ffd(session, con, config, scratch_lib=scratch_lib,
-                        libraries=[lib], resolution_cache=cache),
+                        libraries=[lib], resolution_cache=cache,
+                        progress=progress),
             harvest_dbr(session, con, config, scratch_lib=scratch_lib,
-                        libraries=[lib], resolution_cache=cache),
+                        libraries=[lib], resolution_cache=cache,
+                        progress=progress),
         ):
             for k, v in sub.items():
-                counts[k] += v
+                counts[k] = counts.get(k, 0) + v
     return counts
 
 

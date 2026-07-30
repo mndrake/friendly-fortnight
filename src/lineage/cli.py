@@ -59,6 +59,11 @@ def extract(config: str = _CONFIG_OPT,
     else:
         from .extract.connection import open_session
         session = open_session(cfg.connection)
+    # Live progress goes to stderr so the stdout count summary stays clean
+    # and scriptable; on a multi-minute host run this is the only sign of
+    # life until the final counts.
+    from .extract.progress import Progress
+    prog = Progress(echo=lambda s: typer.echo(s, err=True))
     try:
         from .extract import catalog, hostinfo, source, targeted, xref
         dbmod.reset_layer(con, "raw")
@@ -70,19 +75,30 @@ def extract(config: str = _CONFIG_OPT,
                    f"{source.resolve_strategy(cfg, profile)})")
         typer.echo(f"scope: {resolved_scope}")
         if resolved_scope == "targeted":
-            _echo_counts(targeted.harvest_targeted(session, con, cfg, profile))
+            counts = targeted.harvest_targeted(session, con, cfg, profile,
+                                               progress=prog)
+            _echo_counts(counts)
         else:
+            prog.phase("catalog")
+            catalog_counts = catalog.harvest(session, con, cfg, profile,
+                                             progress=prog)
+            prog.phase("xref")
+            xref_counts = xref.harvest(session, con, cfg, progress=prog)
+            prog.phase("source")
+            source_counts = source.harvest(session, con, cfg, profile,
+                                           progress=prog)
             typer.echo("catalog:")
-            _echo_counts(catalog.harvest(session, con, cfg, profile))
+            _echo_counts(catalog_counts)
             typer.echo("xref:")
-            _echo_counts(xref.harvest(session, con, cfg))
+            _echo_counts(xref_counts)
             typer.echo("source:")
-            _echo_counts(source.harvest(session, con, cfg, profile))
+            _echo_counts(source_counts)
         if not source.verify_roundtrip(con):
             typer.secho(
                 "WARNING: no non-blank source lines retrieved — possible "
                 "CCSID/translation problem", fg=typer.colors.YELLOW)
     finally:
+        prog.close()
         session.close()
         con.close()
 

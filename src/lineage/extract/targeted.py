@@ -60,6 +60,7 @@ from typing import Optional
 from ..config import Config, SourceFileRef
 from .connection import HostSession
 from .hostinfo import HostProfile
+from .progress import NULL, Progress
 
 MAX_ROUNDS = 5
 
@@ -171,29 +172,34 @@ def _resolve_unqualified(con, config: Config, name: str) -> Optional[str]:
 
 
 def harvest_targeted(session: HostSession, con, config: Config,
-                     profile: HostProfile | None = None) -> dict[str, int]:
+                     profile: HostProfile | None = None,
+                     progress: Progress | None = None) -> dict[str, int]:
     from ..db import insert_rows
     from ..graph.build import build_graph
     from ..graph.resolve import backward_lineage
     from . import catalog, objinfo, xref
     from .source import enumerate_members, retrieve_member
 
+    p = progress or NULL
     counts: dict[str, int] = {}
     # Idempotency: a repeat call on the same store must not stack audit rows
     # (the CLI resets the whole raw layer first, but direct callers may not).
     con.execute("DELETE FROM slice_objects")
 
     # -- 1. Seed pass: cheap, broad -----------------------------------------
+    p.phase("seed pass")
     _add_prefixed(counts, "catalog", catalog.harvest(
         session, con, config, profile,
-        only={"SYSCOLUMNS": [], "SYSPARTITIONSTAT": []}))
-    _add_prefixed(counts, "xref", xref.harvest_pgmref(session, con, config))
+        only={"SYSCOLUMNS": [], "SYSPARTITIONSTAT": []}, progress=progress))
+    _add_prefixed(counts, "xref", xref.harvest_pgmref(session, con, config,
+                                                      progress=progress))
 
     sl = _Slice()
     for seed in config.output_seeds:
         sl.add("file", seed.library, seed.file, 0, "seed")
 
     # -- 2. Slice computation: backward walk + transitive callers -----------
+    p.phase("slice computation")
     g = build_graph(con, config, phase=1)
     for seed in config.output_seeds:
         for node_id in backward_lineage(g, seed.node_id):
@@ -289,6 +295,7 @@ def harvest_targeted(session: HostSession, con, config: Config,
             return
         rows = [(lib, srcfile, member, mtype, seq, text) for seq, text in lines]
         n_members_retrieved += 1
+        p.tick("members retrieved", n_members_retrieved)
         n_source_lines += insert_rows(
             con, "raw_source_members",
             ["library", "srcfile", "member", "member_type", "seq", "line_text"],
@@ -301,6 +308,9 @@ def harvest_targeted(session: HostSession, con, config: Config,
             sl.add(kind, nlib, nname, round_no, reason)
 
     for round_no in range(1, MAX_ROUNDS + 1):
+        p.phase(f"round {round_no}")
+        progs_before = len(sl.of_kind("program"))
+        files_before = len(sl.of_kind("file"))
         if discover_libs:
             new_files = [(lib, name) for lib, name in sl.of_kind("file")
                         if (lib, name) not in seen_files and lib]
@@ -327,10 +337,12 @@ def harvest_targeted(session: HostSession, con, config: Config,
         if new_files:
             _add_prefixed(counts, "catalog", catalog.harvest(
                 session, con, config, profile,
-                only={"SYSCOLUMNS": new_files, "SYSPARTITIONSTAT": new_files}))
+                only={"SYSCOLUMNS": new_files, "SYSPARTITIONSTAT": new_files},
+                progress=progress))
             _add_prefixed(counts, "xref", xref.harvest_ffd(
-                session, con, config, files=new_files))
-            dbr_counts = xref.harvest_dbr(session, con, config, files=new_files)
+                session, con, config, files=new_files, progress=progress))
+            dbr_counts = xref.harvest_dbr(session, con, config,
+                                          files=new_files, progress=progress)
             _add_prefixed(counts, "xref", dbr_counts)
 
             based_on = con.execute(
@@ -349,6 +361,7 @@ def harvest_targeted(session: HostSession, con, config: Config,
         # lives (authoritative — immune to member-name != object-name
         # mismatches). On a hit, fetch the *recorded* member (which may
         # differ from the object name) from its recorded source file. -------
+        n_probed_this_round = 0
         for kind, obj_type in (("program", "*PGM"), ("file", "*FILE")):
             for lib, name in sl.of_kind(kind):
                 if not lib:
@@ -358,6 +371,10 @@ def harvest_targeted(session: HostSession, con, config: Config,
                     continue
                 loc = objinfo.source_location(session, lib, name, obj_type)
                 src_locations[key] = loc
+                n_probed_this_round += 1
+                # Rate-only tick: entries discovered mid-round join the work
+                # list live, so a fixed denominator would be a lie.
+                p.tick("objstat lookups", len(src_locations))
                 if loc is None:
                     continue
                 srclib, srcfile, srcmbr = loc
@@ -413,6 +430,10 @@ def harvest_targeted(session: HostSession, con, config: Config,
                     did_anything = True
 
         rounds_run = round_no
+        p.note(f"round {round_no}: +{len(sl.of_kind('program')) - progs_before}"
+               f" programs, +{len(sl.of_kind('file')) - files_before} files, "
+               f"{n_probed_this_round} objstat probes, "
+               f"{n_members_retrieved} members retrieved so far")
         if not did_anything:
             break
 
