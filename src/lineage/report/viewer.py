@@ -25,7 +25,7 @@ from __future__ import annotations
 import html
 import json
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -43,6 +43,17 @@ _ROW_H = 56.0
 _MARGIN = 70.0
 _NODE_H = 34.0
 _BARYCENTER_PASSES = 3
+
+# Display budget for the DAG. A real estate's full upstream cone can run to
+# thousands of nodes (call closures and shared reference files pull in half
+# the system) — rendered raw that is an unreadable smear, so the page shows
+# the *data-flow spine* (calls edges and call-only programs dropped, parallel
+# edges merged) cut off at the deepest layer that still fits the budget.
+# Nodes whose upstream continues past the cut are marked, and the complete
+# subgraph is always available in the sibling lineage_<id>.json.
+_MAX_DAG_NODES = 150
+_MAX_DAG_EDGES = 600
+_CONF_RANK = {"confirmed": 3, "parsed": 2, "inferred": 1, "unresolved": 0}
 
 _KIND_ORDER = ("file", "program")  # DAG keeps only these two node kinds
 
@@ -90,6 +101,8 @@ class _DagNode:
     is_seed: bool
     label: str
     spec: str  # "LIB/NAME", matches the file-segment of column node ids
+    truncated: bool = False  # upstream continues beyond the depth cut
+    unknown: bool = False    # file with no SYSTABLES row (not a SQL object)
     w: float = 0.0
     h: float = _NODE_H
     x: float = 0.0
@@ -139,6 +152,188 @@ def _build_subgraph(graph: nx.MultiDiGraph, seed_node: str
                              "provenance": d.get("provenance"),
                              "confidence": d.get("confidence")})
     return nodes, edges
+
+
+# --- physical-table flow: contract programs/LFs/views out of the picture -------
+
+# QSYS2.SYSTABLES TABLE_TYPE: T = SQL table, P = physical file (both hold
+# data); L/V/M/A (logical, view, materialized, alias) are derived shapes over
+# them — intermediates for a *data* lineage view, like the programs that move
+# the rows.
+_PHYSICAL_TYPES = {"T", "P"}
+
+
+def _systables_types(con) -> dict[tuple[str, str], str]:
+    out: dict[tuple[str, str], str] = {}
+    for schema, name, sysname, ttype in con.execute(
+            "SELECT table_schema, table_name, system_name, table_type "
+            "FROM raw_systables").fetchall():
+        lib = (schema or "").upper()
+        t = (str(ttype) if ttype is not None else "").strip().upper()
+        for nm in (name, sysname):
+            if nm:
+                out[(lib, str(nm).upper())] = t
+    return out
+
+
+def _worse_conf(a: str, b: str) -> str:
+    return a if _CONF_RANK.get(a, 0) <= _CONF_RANK.get(b, 0) else b
+
+
+def _physical_flow(nodes: dict[str, _DagNode], edges: list[dict],
+                   types: dict[tuple[str, str], str]
+                   ) -> tuple[dict[str, _DagNode], list[dict]]:
+    """Contract the raw cone down to physical-table-to-physical-table flow.
+
+    The audience question is "which physical SQL tables feed this output?" —
+    programs, logical files, and views are *how* the data moves, not *where
+    it lives*, so they become part of the arrows: an edge A→B means data
+    flows from table A to table B, its confidence is the weakest hop on the
+    contracted path, and the programs traversed ride along as a ``via`` list
+    for the tooltip. Files with no SYSTABLES row (device files, unresolved
+    references) stay as gray nodes — hiding them would fake certainty.
+    """
+    # Data-flow adjacency (direction = the way rows move).
+    flow: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for e in edges:
+        kind = e.get("kind")
+        if kind == "reads":            # program reads file: file -> program
+            u, v = e["dst"], e["src"]
+        elif kind == "writes":         # program writes file: program -> file
+            u, v = e["src"], e["dst"]
+        elif kind == "derives_from":   # a derives from b: b -> a
+            u, v = e["dst"], e["src"]
+        else:
+            continue
+        flow[u].append((v, e.get("confidence") or "unresolved"))
+
+    def _category(n: _DagNode) -> str:
+        if n.kind != "file":
+            return "intermediate"
+        t = types.get(((n.library or "").upper(), n.name.upper()))
+        if t is None:
+            return "unknown"
+        return "physical" if t in _PHYSICAL_TYPES else "intermediate"
+
+    kept_ids = {nid for nid, n in nodes.items()
+                if n.is_seed or _category(n) != "intermediate"}
+
+    contracted: dict[tuple[str, str], dict] = {}
+    for src in kept_ids:
+        seen = {src}
+        stack = [(v, conf, ()) for v, conf in flow.get(src, ())]
+        while stack:
+            v, conf, via = stack.pop()
+            if v in seen:
+                continue
+            seen.add(v)
+            if v in kept_ids:
+                key = (src, v)
+                cur = contracted.get(key)
+                if cur is None or (_CONF_RANK.get(conf, 0)
+                                   > _CONF_RANK.get(cur["confidence"], 0)):
+                    contracted[key] = {
+                        "src": src, "dst": v, "kind": "flow",
+                        "provenance": "contracted",
+                        "confidence": conf, "via": list(via)}
+                continue
+            vn = nodes.get(v)
+            nvia = via + ((vn.spec,) if vn is not None
+                          and vn.kind == "program" else ())
+            for w, conf2 in flow.get(v, ()):
+                stack.append((w, _worse_conf(conf, conf2), nvia))
+
+    # Depth = contracted hops upstream of the seed (reverse BFS); nodes with
+    # no contracted path to the seed carry no data into it — drop them.
+    incoming: dict[str, list[str]] = defaultdict(list)
+    for (src, dst), _e in contracted.items():
+        incoming[dst].append(src)
+    seed_ids = [nid for nid in kept_ids if nodes[nid].is_seed]
+    depth: dict[str, int] = {nid: 0 for nid in seed_ids}
+    frontier = list(seed_ids)
+    while frontier:
+        nxt: list[str] = []
+        for nid in frontier:
+            for up in incoming.get(nid, ()):
+                if up not in depth:
+                    depth[up] = depth[nid] + 1
+                    nxt.append(up)
+        frontier = nxt
+
+    out_nodes: dict[str, _DagNode] = {}
+    for nid in kept_ids:
+        if nid not in depth:
+            continue
+        n = nodes[nid]
+        out_nodes[nid] = replace(n, depth=depth[nid], truncated=False,
+                                 unknown=(_category(n) == "unknown"))
+    out_edges = [e for (src, dst), e in contracted.items()
+                 if src in out_nodes and dst in out_nodes]
+    return out_nodes, out_edges
+
+
+# --- table/program DAG: pruning to the data-flow spine --------------------------
+
+def _prune(nodes: dict[str, _DagNode], edges: list[dict]
+           ) -> tuple[dict[str, _DagNode], list[dict], dict]:
+    """Reduce the raw upstream cone to a drawable data-flow spine.
+
+    Steps, each recorded in the returned stats dict so the page can say
+    exactly what was omitted:
+
+    1. Drop ``calls`` edges — call chains matter for override context during
+       extraction/build, but on the DAG they connect everything to
+       everything and carry no data flow.
+    2. Drop programs left with no incident edges (call-only drivers).
+    3. Merge parallel edges of the same (src, dst, kind), keeping the
+       highest-confidence one and a count.
+    4. Cut at the deepest layer that keeps the node/edge counts within the
+       display budget; mark surviving nodes whose upstream got cut.
+    """
+    stats = {"total_nodes": len(nodes), "total_edges": len(edges)}
+
+    data_edges = [e for e in edges if e["kind"] != "calls"]
+    stats["calls_edges_dropped"] = len(edges) - len(data_edges)
+    touched = ({e["src"] for e in data_edges}
+               | {e["dst"] for e in data_edges})
+    kept = {nid: n for nid, n in nodes.items()
+            if nid in touched or n.is_seed}
+    stats["call_only_nodes_dropped"] = len(nodes) - len(kept)
+
+    merged: dict[tuple[str, str, str], dict] = {}
+    for e in data_edges:
+        key = (e["src"], e["dst"], e["kind"] or "")
+        cur = merged.get(key)
+        if cur is None:
+            merged[key] = dict(e, count=1)
+        elif (_CONF_RANK.get(e["confidence"] or "", 0)
+              > _CONF_RANK.get(cur["confidence"] or "", 0)):
+            merged[key].update(confidence=e["confidence"],
+                               provenance=e["provenance"],
+                               count=cur["count"] + 1)
+        else:
+            cur["count"] += 1
+    data_edges = list(merged.values())
+
+    def _cut(depth_cap: int) -> tuple[dict[str, _DagNode], list[dict]]:
+        ns = {nid: n for nid, n in kept.items() if n.depth <= depth_cap}
+        es = [e for e in data_edges if e["src"] in ns and e["dst"] in ns]
+        return ns, es
+
+    max_depth = max((n.depth for n in kept.values()), default=0)
+    depth_cap = max_depth
+    shown, shown_edges = _cut(depth_cap)
+    while depth_cap > 1 and (len(shown) > _MAX_DAG_NODES
+                             or len(shown_edges) > _MAX_DAG_EDGES):
+        depth_cap -= 1
+        shown, shown_edges = _cut(depth_cap)
+    for e in data_edges:
+        if e["dst"] in shown and e["src"] not in shown:
+            shown[e["dst"]].truncated = True
+    stats["depth_cap"] = depth_cap
+    stats["max_depth"] = max_depth
+    stats["nodes_beyond_cut"] = len(kept) - len(shown)
+    return shown, shown_edges, stats
 
 
 # --- table/program DAG: layout -------------------------------------------------
@@ -217,30 +412,39 @@ def _edge_path(x1: float, y1: float, w1: float, x2: float, y2: float, w2: float,
 
 
 def _render_svg(nodes: dict[str, _DagNode], edges: list[dict],
-                draw_w: float, draw_h: float) -> str:
+                draw_w: float, draw_h: float,
+                dom_id: str = "dag-svg") -> str:
     if not nodes:
         return ('<p class="note">No table/program lineage found for this '
                'seed (its node is not present in the built graph).</p>')
 
     incident: dict[str, list[dict]] = defaultdict(list)
     for e in edges:
+        count = e.get("count", 1)
+        kind_txt = (e["kind"] or "?") + (f" ×{count}" if count > 1 else "")
+        via = e.get("via") or []
+        if via:
+            shown_via = ", ".join(via[:4]) + ("…" if len(via) > 4 else "")
+            kind_txt += f" via {shown_via}"
         incident[e["src"]].append({"dir": "out", "other": e["dst"],
-                                   "kind": e["kind"],
+                                   "kind": kind_txt,
                                    "provenance": e["provenance"],
                                    "confidence": e["confidence"]})
         incident[e["dst"]].append({"dir": "in", "other": e["src"],
-                                   "kind": e["kind"],
+                                   "kind": kind_txt,
                                    "provenance": e["provenance"],
                                    "confidence": e["confidence"]})
 
     parts: list[str] = []
-    parts.append(f'<svg id="dag-svg" viewBox="0 0 {draw_w:.0f} {draw_h:.0f}" '
+    parts.append(f'<svg id="{dom_id}" class="dagview" '
+                f'viewBox="0 0 {draw_w:.0f} {draw_h:.0f}" '
                 f'preserveAspectRatio="xMidYMid meet" width="100%" '
                 f'height="100%">')
     parts.append("<defs>")
     for conf, color in _CONF_COLOR.items():
         parts.append(
-            f'<marker id="arrow-{conf}" viewBox="0 0 10 10" refX="9" refY="5" '
+            f'<marker id="arrow-{dom_id}-{conf}" viewBox="0 0 10 10" '
+            f'refX="9" refY="5" '
             f'markerWidth="7" markerHeight="7" orient="auto">'
             f'<path d="M0,0 L10,5 L0,10 z" fill="{color}"></path></marker>')
     parts.append("</defs>")
@@ -265,14 +469,16 @@ def _render_svg(nodes: dict[str, _DagNode], edges: list[dict],
             f'data-dst="{_attr(e["dst"])}" data-kind="{_attr(e["kind"])}" '
             f'data-confidence="{_attr(conf)}" d="{d}" fill="none" '
             f'stroke="{color}"{dash_attr} stroke-width="2" '
-            f'marker-end="url(#arrow-{conf if conf in _CONF_COLOR else "unresolved"})">'
-            f'</path>')
+            f'marker-end="url(#arrow-{dom_id}-'
+            f'{conf if conf in _CONF_COLOR else "unresolved"})"></path>')
     parts.append("</g>")
 
     parts.append('<g class="nodes">')
     for nid, n in nodes.items():
         rx = 12 if n.kind == "program" else 1
-        cls = f"node node-{n.kind}" + (" seed" if n.is_seed else "")
+        cls = f"node node-{n.kind}" + (" seed" if n.is_seed else "") \
+            + (" node-truncated" if n.truncated else "") \
+            + (" node-unknown" if n.unknown else "")
         edges_json = _attr(json.dumps(incident.get(nid, [])))
         parts.append(
             f'<g class="{cls}" data-id="{_attr(nid)}" data-kind="{_attr(n.kind)}" '
@@ -300,6 +506,9 @@ _LEGEND = """
     <span><svg width="18" height="14"><rect x="1" y="1" width="16" height="12"
       fill="#e0f2fe" stroke="#b45309" stroke-width="3"></rect></svg>
       seed (this output)</span>
+    <span><svg width="18" height="14"><rect x="1" y="1" width="16" height="12"
+      fill="#e0f2fe" stroke="#0369a1" stroke-dasharray="4,3"></rect></svg>
+      upstream continues beyond cut</span>
   </div>
   <div class="legend-group">
     <b>Edge confidence</b>
@@ -312,9 +521,9 @@ _LEGEND = """
     <b>Edge kind (dash pattern)</b>
     <span>reads: solid</span>
     <span>writes: long dash</span>
-    <span>calls: dotted</span>
     <span>derives_from: fine dotted</span>
     <span>defines: dash-dot</span>
+    <span>(call edges omitted from the DAG)</span>
   </div>
   <div class="legend-group">
     <b>Interact</b>
@@ -440,11 +649,16 @@ a { color: #0369a1; }
 .dag-wrap { position: relative; border: 1px solid #cbd5e1; border-radius: 6px;
            background: #f8fafc; overflow: hidden; height: 70vh;
            min-height: 420px; }
-#dag-svg { width: 100%; height: 100%; cursor: grab; display: block; }
-#dag-svg.dragging { cursor: grabbing; }
+.dagview { width: 100%; height: 100%; cursor: grab; display: block; }
+.dagview.dragging { cursor: grabbing; }
 .node rect { transition: opacity .1s; }
 .node text { font-size: 11px; pointer-events: none; fill: #1a1a2e; }
 .node.seed rect { stroke: #b45309; }
+.node.node-truncated rect { stroke-dasharray: 5,3; }
+.node.node-unknown rect { fill: #f1f5f9; stroke: #64748b; }
+details.spine { margin-top: 1.2rem; }
+details.spine > summary { cursor: pointer; color: #16324f; font-weight: 600; }
+details.spine .dag-wrap { margin-top: .6rem; }
 .node.node-dim { opacity: .25; }
 .edge { opacity: .85; transition: opacity .1s, stroke-width .1s; }
 .edge.edge-dim { opacity: .08; }
@@ -483,8 +697,8 @@ details.hop > summary { cursor: pointer; }
 
 _JS = """
 (function () {
-  var svg = document.getElementById('dag-svg');
-  if (!svg) return;
+  document.querySelectorAll('svg.dagview').forEach(initDag);
+  function initDag(svg) {
   var vb = svg.getAttribute('viewBox').split(' ').map(Number);
   var box = { x: vb[0], y: vb[1], w: vb[2], h: vb[3] };
   var fullW = vb[2], fullH = vb[3];
@@ -592,16 +806,22 @@ _JS = """
       setTimeout(function () { target.classList.remove('flash'); }, 1500);
     });
   });
+  }
 })();
 """
 
 _PAGE_TMPL = """<style>{css}</style>
 <h1>Lineage &mdash; {title}</h1>
 <p class="meta">{meta}</p>
-<h2>Table / program DAG</h2>
-<p class="note">{dag_note}</p>
-<div class="dag-wrap">{svg}</div>
+<h2>Physical table flow</h2>
+<p class="note">{phys_note}</p>
+<div class="dag-wrap">{phys_svg}</div>
 {legend}
+<details class="spine">
+  <summary>Detailed table / program graph ({spine_count} nodes)</summary>
+  <p class="note">{spine_meta}</p>
+  <div class="dag-wrap">{spine_svg}</div>
+</details>
 <div class="tooltip" id="dag-tooltip"></div>
 {columns}
 <script>{js}</script>
@@ -609,19 +829,65 @@ _PAGE_TMPL = """<style>{css}</style>
 
 
 def _render_page(con, graph: nx.MultiDiGraph, seed) -> str:
-    nodes, edges = _build_subgraph(graph, seed.node_id)
+    raw_nodes, raw_edges = _build_subgraph(graph, seed.node_id)
+
+    # Primary view: physical SQL tables only — programs/LFs/views contracted
+    # into the arrows (the audience question is where the data *lives*, not
+    # every hop it takes). The detailed spine stays one click away.
+    phys_nodes, phys_edges = _physical_flow(
+        raw_nodes, raw_edges, _systables_types(con))
+    phys_nodes, phys_edges, phys_stats = _prune(phys_nodes, phys_edges)
+    pw, ph = _layout(phys_nodes, phys_edges)
+    phys_svg = _render_svg(phys_nodes, phys_edges, pw, ph, dom_id="dag-phys")
+
+    nodes, edges, stats = _prune(raw_nodes, raw_edges)
     draw_w, draw_h = _layout(nodes, edges)
-    svg = _render_svg(nodes, edges, draw_w, draw_h)
+    spine_svg = _render_svg(nodes, edges, draw_w, draw_h, dom_id="dag-spine")
+
     columns_html = _column_lineage_section(con, graph, seed)
     title = f"{_esc(seed.id)} ({_esc(seed.library)}/{_esc(seed.file)})"
-    meta = (f"{len(nodes)} table/program node(s), {len(edges)} edge(s) "
-           f"upstream of <code>{_esc(seed.node_id)}</code>.")
-    dag_note = "" if nodes else (
-        f"Seed node <code>{_esc(seed.node_id)}</code> is not present in the "
-        "built graph — nothing to draw.")
-    legend = _LEGEND if nodes else ""
+    meta = (f"{len(phys_nodes)} physical table(s) feed "
+            f"<code>{_esc(seed.node_id)}</code> "
+            f"(full upstream cone: {stats['total_nodes']} node(s), "
+            f"{stats['total_edges']} edge(s); complete subgraph in "
+            f"<code>lineage_{_esc(seed.id)}.json</code>).")
+    phys_note = (
+        "Physical SQL tables (TABLE_TYPE T/P) only. Programs, logical "
+        "files, and views are contracted into the arrows &mdash; hover a "
+        "node to see which programs carry the data (<i>via ...</i>). Gray "
+        "nodes are files with no SYSTABLES row (device files or unresolved "
+        "references); arrow color is the weakest confidence on the "
+        "contracted path.")
+    if phys_stats.get("nodes_beyond_cut"):
+        phys_note += (f" Showing depth &le; {phys_stats['depth_cap']} of "
+                      f"{phys_stats['max_depth']}; dash-outlined nodes have "
+                      "hidden upstream.")
+    if not phys_nodes:
+        phys_note = ("No physical-table flow to draw for this seed"
+                     + ("." if raw_nodes else
+                        " (its node is not present in the built graph)."))
+    omitted: list[str] = []
+    if stats.get("calls_edges_dropped"):
+        omitted.append(f"{stats['calls_edges_dropped']} call edges")
+    if stats.get("call_only_nodes_dropped"):
+        omitted.append(f"{stats['call_only_nodes_dropped']} call-only "
+                       "programs")
+    if stats.get("nodes_beyond_cut"):
+        omitted.append(
+            f"{stats['nodes_beyond_cut']} nodes deeper than "
+            f"{stats['depth_cap']} hops (of {stats['max_depth']}) — "
+            "dash-outlined nodes have hidden upstream")
+    spine_meta = (f"Data-flow spine: {len(nodes)} of {stats['total_nodes']} "
+                  f"upstream node(s), {len(edges)} edge(s).")
+    if omitted:
+        spine_meta += (" Omitted for readability: " + "; ".join(omitted)
+                       + f". Complete subgraph: "
+                       f"<code>lineage_{_esc(seed.id)}.json</code>.")
+    legend = _LEGEND if (phys_nodes or nodes) else ""
     return _PAGE_TMPL.format(css=_CSS, title=title, meta=meta,
-                             dag_note=dag_note, svg=svg, legend=legend,
+                             phys_note=phys_note, phys_svg=phys_svg,
+                             spine_count=len(nodes), spine_meta=spine_meta,
+                             spine_svg=spine_svg, legend=legend,
                              columns=columns_html, js=_JS)
 
 

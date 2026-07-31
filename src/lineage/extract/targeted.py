@@ -392,9 +392,17 @@ def harvest_targeted(session: HostSession, con, config: Config,
 
         did_anything = bool(new_files)
         if new_files:
+            # SYSTABLES/SYSVIEWS are scoped to the slice pairs too: the seed
+            # pass only pulls them for config.libraries, but output tables
+            # usually live in *data* libraries the slice discovers — without
+            # their SYSTABLES rows the table has no catalog identity
+            # (column-trace target resolution, unqualified-name resolution,
+            # table_type classification all miss). Pair-dedup makes the
+            # config-library pairs free.
             _add_prefixed(counts, "catalog", catalog.harvest(
                 session, con, config, profile,
-                only={"SYSCOLUMNS": new_files, "SYSPARTITIONSTAT": new_files},
+                only={"SYSCOLUMNS": new_files, "SYSPARTITIONSTAT": new_files,
+                      "SYSTABLES": new_files, "SYSVIEWS": new_files},
                 progress=progress))
             # Only files the catalog just confirmed (columns present under
             # either name) get per-file DSP commands; the rest would fail

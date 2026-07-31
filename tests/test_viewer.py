@@ -145,3 +145,67 @@ def test_page_renders_for_seed_absent_from_graph(built, tmp_path):
     assert "<style>" in text and "</script>" in text
     # No table/program DAG data for a node the graph never saw.
     assert "not present in the built graph" in text
+
+
+# --- DAG pruning: data-flow spine, not the whole cone --------------------------
+
+def test_dag_omits_call_edges_and_call_only_programs(built, config):
+    """CLDYN only *calls* into the slice (no reads/writes) — with call edges
+    dropped it must vanish from the DAG; the data-flow files stay."""
+    from lineage.report import viewer
+
+    con, graph = built
+    page = viewer._render_page(con, graph, config.output_seeds[0])
+    svg = page.split('class="dag-wrap"')[1].split("</svg>")[0]
+    assert 'data-kind="calls"' not in svg
+    assert "CLDYN" not in svg            # call-only driver pruned
+    assert "CUSTMAST" in svg             # data flow intact
+    assert "call edges" in page          # omission is stated, not silent
+
+
+def test_dag_depth_cut_marks_truncated_nodes(built, config, monkeypatch):
+    """With a tiny node budget the DAG cuts at a shallow depth, says so in
+    the meta line, and dash-marks nodes whose upstream continues."""
+    from lineage.report import viewer
+
+    monkeypatch.setattr(viewer, "_MAX_DAG_NODES", 2)
+    con, graph = built
+    page = viewer._render_page(con, graph, config.output_seeds[0])
+    assert "nodes deeper than" in page
+    assert "node-truncated" in page
+    assert "Complete subgraph" in page
+
+
+def test_dag_merges_parallel_edges(built, config):
+    """No two rendered edge paths share (src, dst, kind) — parallel evidence
+    is merged into one edge with a count."""
+    from lineage.report import viewer
+
+    con, graph = built
+    nodes, edges = viewer._build_subgraph(graph, config.output_seeds[0].node_id)
+    shown_nodes, shown_edges, _stats = viewer._prune(nodes, edges)
+    keys = [(e["src"], e["dst"], e["kind"]) for e in shown_edges]
+    assert len(keys) == len(set(keys))
+
+
+# --- Physical-table flow: the default data-lineage view ------------------------
+
+def test_physical_view_contracts_programs_and_logical_files(built, config):
+    """The primary view answers 'which physical tables feed this output' —
+    RPT001 (program) and CUSTLF1 (logical file) must be contracted into the
+    arrows, with the program riding along as the edge's 'via'."""
+    from lineage.report import viewer
+
+    con, graph = built
+    page = viewer._render_page(con, graph, config.output_seeds[0])
+    phys_svg = page.split('class="dag-wrap"')[1].split("</svg>")[0]
+    assert "CUSTRPT" in phys_svg         # the output itself
+    assert "CUSTMAST" in phys_svg        # physical base
+    assert "ORDHIST" in phys_svg         # physical base (post-override)
+    assert "CUSTLF1" not in phys_svg     # logical file: contracted away
+    assert "RPT001" not in phys_svg.replace("via APPLIB/RPT001", "")
+    assert "via APPLIB/RPT001" in phys_svg   # ...but visible on the arrows
+    assert 'data-kind="flow"' in phys_svg
+    assert "Physical table flow" in page
+    # The detailed spine is still there, one click away.
+    assert "Detailed table / program graph" in page

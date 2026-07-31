@@ -988,3 +988,43 @@ def test_scoped_catalog_pull_matches_system_names():
     assert counts2["raw_syscolumns"] == 0
     assert dbmod2.table_count(con, "raw_syscolumns") == 1
     con.close()
+
+
+def test_rounds_scope_pull_systables_for_slice_pairs():
+    """Output tables live in data libraries outside config.libraries; the
+    rounds must pull their SYSTABLES rows scoped by pair, or the table has
+    no catalog identity (live symptom: column-trace 'Table not found in
+    raw_systables' for a DDL output)."""
+    from lineage.extract import targeted
+
+    session = _synthetic_session(["WRITER"])   # seed systables pull is empty
+    con = dbmod.connect(None)
+    targeted.harvest_targeted(session, con, _synthetic_config())
+
+    assert any("QSYS2.SYSTABLES" in q and "OUT1" in q
+               for q in session.sql_log), \
+        "no pair-scoped SYSTABLES pull was issued for the slice"
+    assert any("QSYS2.SYSVIEWS" in q and "OUT1" in q
+               for q in session.sql_log)
+    con.close()
+
+
+def test_scoped_systables_pull_inserts_discovered_table():
+    from lineage.extract import catalog
+
+    session = FixtureHostSession(responses={
+        "catalog.systables": QueryResult(
+            columns=["table_schema", "table_name", "system_name",
+                     "table_type", "file_type", "row_count", "long_comment"],
+            rows=[("TNTACCDTA", "BROAST", "BROAST", "T", "D", 100, None)]),
+    })
+    con = dbmod.connect(None)
+    counts = catalog.harvest(
+        session, con, _synthetic_config(),
+        only={"SYSTABLES": [("TNTACCDTA", "BROAST")], "SYSCOLUMNS": [],
+              "SYSPARTITIONSTAT": [], "SYSVIEWS": [], "SYSVIEWDEP": []})
+    assert counts["raw_systables"] == 1
+    row = con.execute(
+        "SELECT table_schema, table_name FROM raw_systables").fetchone()
+    assert row == ("TNTACCDTA", "BROAST")
+    con.close()
