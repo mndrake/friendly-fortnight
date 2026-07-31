@@ -285,6 +285,15 @@ def harvest(session: HostSession, con, config,
             p.done(f"catalog {spec.name} ({len(todo)} pairs)",
                    rows=counts[spec.raw_table])
             continue
+        # Idempotency for unscoped pulls, mirroring the pairs branch and the
+        # xref pair-skipping: a raw table that already holds rows is not
+        # re-pulled (a repeat call would duplicate every row). The CLI resets
+        # the raw layer before a normal extract, so full mode still pulls;
+        # `lineage extract --resume` and repeat direct calls skip instead.
+        if con.execute(
+                f"SELECT count(*) FROM {spec.raw_table}").fetchone()[0]:
+            counts[spec.raw_table] = 0
+            continue
         sql, missing = spec.build_select(available, libs)
         if missing:
             counts[f"{spec.name}_missing_columns"] = len(missing)

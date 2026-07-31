@@ -266,7 +266,16 @@ def harvest_pgmref(session: HostSession, con, config,
     counts = {"raw_dsppgmref": 0}
     if resolution_cache is None:
         resolution_cache = {}
+    # Libraries whose rows are already present are skipped — the same
+    # idempotency rule as the per-file FFD/DBR pair-skipping, and what makes
+    # `lineage extract --resume` cheap. (A library with zero programs leaves
+    # no rows and is re-run on resume; DSPPGMREF over an empty library is
+    # fast and harmless.)
+    done_libs = {(r[0] or "").upper() for r in con.execute(
+        "SELECT DISTINCT program_lib FROM raw_dsppgmref").fetchall()}
     for lib in (config.libraries if libraries is None else libraries):
+        if lib.upper() in done_libs:
+            continue
         pgm_of = f"{scratch}/PGMREF"
         p.start(f"DSPPGMREF {lib}/*ALL")
         session.run_cl(

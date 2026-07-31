@@ -40,7 +40,14 @@ def extract(config: str = _CONFIG_OPT,
                            "instead of connecting to the LPAR"),
             scope: Optional[str] = typer.Option(
                 None, help="Extraction scope: full|targeted "
-                           "(default: config's extraction_scope)")) -> None:
+                           "(default: config's extraction_scope)"),
+            resume: bool = typer.Option(
+                False, "--resume",
+                help="Keep the existing raw layer instead of resetting it: "
+                     "already-harvested libraries, (library, file) pairs, "
+                     "and source members are skipped, so a crashed or "
+                     "killed targeted run continues where it left off. "
+                     "Targeted scope only.")) -> None:
     """Pull catalogs, cross-references, and source members into the raw store."""
     cfg = _load(config)
     con = _con(cfg)
@@ -49,6 +56,10 @@ def extract(config: str = _CONFIG_OPT,
     if resolved_scope not in EXTRACTION_SCOPES:
         raise typer.BadParameter(
             f"--scope must be one of {EXTRACTION_SCOPES}, got '{resolved_scope}'")
+    if resume and resolved_scope != "targeted":
+        raise typer.BadParameter(
+            "--resume requires targeted scope (full-mode source retrieval "
+            "has no per-member skip and would duplicate rows)")
     if resolved_scope == "full" and not cfg.source_files:
         raise typer.BadParameter(
             "full extraction requires source_files; targeted mode can "
@@ -66,7 +77,11 @@ def extract(config: str = _CONFIG_OPT,
     prog = Progress(echo=lambda s: typer.echo(s, err=True))
     try:
         from .extract import catalog, hostinfo, source, targeted, xref
-        dbmod.reset_layer(con, "raw")
+        if resume:
+            typer.echo("resume: keeping existing raw layer — "
+                       "already-harvested work will be skipped")
+        else:
+            dbmod.reset_layer(con, "raw")
         profile = hostinfo.probe(session)
         profile.save(con)
         typer.echo(f"host: {profile.version_label} "
@@ -300,7 +315,7 @@ def run(config: str = _CONFIG_OPT,
             None, help="Extraction scope: full|targeted "
                        "(default: config's extraction_scope)")) -> None:
     """extract → parse → build → analyze → report, end to end."""
-    extract(config=config, fixture_dir=fixture_dir, scope=scope)
+    extract(config=config, fixture_dir=fixture_dir, scope=scope, resume=False)
     parse(config=config)
     build(config=config, phase=phase)
     analyze(config=config)

@@ -859,3 +859,64 @@ def test_objstat_bulk_scan_failure_falls_back_to_per_object(monkeypatch):
         "name='WRITER'").fetchone()[0]
     assert src_ref == "TESTLIB/QCLSRC(WRITER)"   # per-object probe still won
     con.close()
+
+
+# --- Regression: library-less slice entries must not crash the objstat pass ---
+
+def test_libraryless_entry_does_not_crash_objstat_grouping():
+    """WRITER's CL calls an unqualified HELPER: the slice then holds
+    (None, 'HELPER') next to ('TESTLIB', 'WRITER'), and the objstat
+    grouping pass sorts that mix — a plain sorted() raised TypeError
+    ('<' between NoneType and str) and killed a 3-hour live run."""
+    from lineage.extract import targeted
+
+    session = _synthetic_session(["WRITER"], extra_responses={
+        "source.text.TESTLIB.QCLSRC.WRITER": QueryResult(
+            columns=["SRCSEQ", "SRCDTA"],
+            rows=[(1, "PGM"), (2, "CALL PGM(HELPER)"), (3, "ENDPGM")]),
+    })
+    con = dbmod.connect(None)
+    counts = targeted.harvest_targeted(session, con, _synthetic_config())
+
+    sl = _slice_rows(con)
+    assert ("program", None, "HELPER") in sl    # placeholder survived intact
+    assert counts["slice.rounds"] >= 2          # the pass after discovery ran
+    con.close()
+
+
+# --- Resume: a second pass over the same store refetches nothing --------------
+
+def test_targeted_resume_reuses_members_without_host_fetches(config, session):
+    import conftest as conftest_mod
+    from lineage.extract import hostinfo, targeted
+
+    con = dbmod.connect(None)
+    profile = hostinfo.probe(session)
+    first = targeted.harvest_targeted(session, con, config, profile)
+    assert first["slice.members_retrieved"] > 0
+
+    session2 = conftest_mod.build_session()
+    second = targeted.harvest_targeted(session2, con, config, profile)
+    # Same slice, zero member fetches: every member came from the store.
+    assert second["slice.members_retrieved"] == 0
+    assert second["slice.members_reused"] == first["slice.members_retrieved"]
+    assert not any("SRCSEQ" in q or "IFS_READ" in q for q in session2.sql_log)
+    # No re-issued DSPPGMREF either — the library's rows are already present.
+    assert not any(c.startswith("DSPPGMREF") for c in session2.cl_log)
+    con.close()
+
+
+def test_unscoped_catalog_pull_is_idempotent(config, session):
+    import conftest as conftest_mod
+    from lineage import db as dbmod2
+    from lineage.extract import catalog, hostinfo
+
+    con = dbmod.connect(None)
+    profile = hostinfo.probe(session)
+    catalog.harvest(session, con, config, profile)
+    before = dbmod2.table_count(con, "raw_systables")
+    session2 = conftest_mod.build_session()
+    second = catalog.harvest(session2, con, config, profile)
+    assert dbmod2.table_count(con, "raw_systables") == before
+    assert second["raw_systables"] == 0
+    con.close()

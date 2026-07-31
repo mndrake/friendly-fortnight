@@ -22,6 +22,7 @@ round-trip check verifies a member reads back as text
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from ..config import Config, SourceFileRef
@@ -90,9 +91,30 @@ def resolve_strategy(config: Config,
     return "ifs_read"
 
 
+@dataclass
+class RetrievalStats:
+    """Per-run adaptive state for ``auto`` retrieval mode.
+
+    On an estate where every source file is a data PF or SRCDTA is CCSID
+    65535, *every* member pays a doomed IFS_READ query before the alias
+    fallback serves it — thousands of wasted host calls on a big run. After
+    ``DEMOTE_AFTER_FALLBACKS`` consecutive fallbacks with no IFS success,
+    the run demotes itself to the alias strategy outright. Only ``auto``
+    mode ever demotes; an explicit ``ifs_read``/``alias`` config is obeyed
+    verbatim.
+    """
+
+    consecutive_fallbacks: int = 0
+    demoted: bool = False
+
+
+DEMOTE_AFTER_FALLBACKS = 5
+
+
 def retrieve_member(session: HostSession, src: SourceFileRef, member: str,
                     config: Config,
-                    profile: HostProfile | None = None
+                    profile: HostProfile | None = None,
+                    stats: RetrievalStats | None = None
                     ) -> tuple[list[tuple[int, str]], str]:
     """Retrieve one member's lines as ``(seq, text)``.
 
@@ -103,20 +125,30 @@ def retrieve_member(session: HostSession, src: SourceFileRef, member: str,
     PFs (text-mode QSYS.LIB access only supports source PFs and single-field
     program-described PFs) and for SRCDTA CCSID 65535 (no conversion) — and
     raises outright on releases without the function. The alias path is plain
-    record-level SQL and works for all of these.
+    record-level SQL and works for all of these. ``stats``, when passed by a
+    harvest loop, carries the adaptive demotion state across members.
     """
     strategy = resolve_strategy(config, profile)
     if strategy == "alias":
         return retrieve_member_alias(session, src, member,
                                      config.scratch_lib), "alias"
+    if stats is not None and stats.demoted:
+        return retrieve_member_alias(session, src, member,
+                                     config.scratch_lib), "alias_demoted"
     try:
         lines = retrieve_member_ifs(session, src, member)
     except Exception:  # noqa: BLE001 - e.g. IFS_READ absent on this release
         lines = []
     if lines:
+        if stats is not None:
+            stats.consecutive_fallbacks = 0
         return lines, "ifs_read"
     fallback = retrieve_member_alias(session, src, member, config.scratch_lib)
     if fallback:
+        if stats is not None and config.source_retrieval == "auto":
+            stats.consecutive_fallbacks += 1
+            if stats.consecutive_fallbacks >= DEMOTE_AFTER_FALLBACKS:
+                stats.demoted = True
         return fallback, "alias_fallback"
     return lines, "ifs_read"
 
@@ -213,6 +245,7 @@ def harvest(session: HostSession, con, config: Config,
     rows: list[tuple[Any, ...]] = []
     fallbacks = 0
     retrieval_failures = 0
+    stats = RetrievalStats()
     for src in config.source_files:
         members = enumerate_members(session, src, profile)
         label = f"source {src.library}/{src.file}"
@@ -223,7 +256,7 @@ def harvest(session: HostSession, con, config: Config,
             member_type = m.get("member_type")
             try:
                 lines, strategy = retrieve_member(session, src, member,
-                                                  config, profile)
+                                                  config, profile, stats=stats)
             except Exception:  # noqa: BLE001 - counted, not fatal
                 retrieval_failures += 1
                 file_failures += 1
@@ -232,6 +265,10 @@ def harvest(session: HostSession, con, config: Config,
             if strategy == "alias_fallback":
                 fallbacks += 1
                 file_fallbacks += 1
+                if stats.demoted and fallbacks == stats.consecutive_fallbacks:
+                    p.note("IFS_READ demoted to alias for the rest of the "
+                           f"run after {stats.consecutive_fallbacks} "
+                           "consecutive fallbacks")
             for seq, text in lines:
                 rows.append((src.library, src.file, member, member_type, seq, text))
             p.tick(f"members {src.library}/{src.file}", i, len(members))
@@ -247,6 +284,9 @@ def harvest(session: HostSession, con, config: Config,
         # Members IFS_READ could not open in text mode (data-PF source files
         # or CCSID 65535); the alias strategy served them instead.
         counts["ifs_read_fallbacks"] = fallbacks
+    if stats.demoted:
+        # Make it permanent with `source_retrieval: alias` in config.yaml.
+        counts["source_strategy_demoted"] = 1
     if retrieval_failures:
         counts["member_retrieval_failures"] = retrieval_failures
     return counts

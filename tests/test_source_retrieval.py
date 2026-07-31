@@ -2,7 +2,8 @@
 import pytest
 
 from lineage.config import ConfigError, SourceFileRef, from_dict
-from lineage.extract.connection import HostError, QueryResult
+from lineage.extract.connection import (FixtureHostSession, HostError,
+                                        QueryResult)
 from lineage.extract.source import (harvest, ifs_member_path,
                                     retrieve_member, retrieve_member_alias,
                                     retrieve_member_ifs)
@@ -346,3 +347,109 @@ def test_enumerate_members_handles_uppercase_jdbc_labels():
 
     members = enumerate_members(_UppercaseLabelSession(), SRC)
     assert members == [{"member": "BROAST", "member_type": "SQL"}]
+
+
+# --- Adaptive strategy demotion (auto mode only) -------------------------------
+
+def _ifs_dead_session(members: list[str]) -> FixtureHostSession:
+    """Every IFS_READ returns zero rows; every alias read succeeds — the
+    systematic-fallback estate (data-PF source files / CCSID 65535)."""
+    responses = {
+        "source.members.APPLIB.QCLSRC": QueryResult(
+            columns=["member", "member_type"],
+            rows=[(m, "CLP") for m in members]),
+    }
+
+    class _Session(FixtureHostSession):
+        def query(self, sql, params=()):
+            if "IFS_READ" in sql:
+                self.sql_log.append(sql)
+                self._last_tag = None
+                return QueryResult(columns=["LINE_NUMBER", "LINE"], rows=[])
+            if "SRCSEQ" in sql:
+                self.sql_log.append(sql)
+                self._last_tag = None
+                return QueryResult(columns=["SRCSEQ", "SRCDTA"],
+                                   rows=[(1, "PGM"), (2, "ENDPGM")])
+            if sql.startswith(("CREATE ALIAS", "DROP ALIAS")):
+                self.sql_log.append(sql)
+                self._last_tag = None
+                return QueryResult(columns=[], rows=[])
+            return super().query(sql)
+
+    return _Session(responses=responses)
+
+
+def test_auto_mode_demotes_after_consecutive_fallbacks():
+    from lineage import db as dbmod
+    from lineage.config import from_dict
+    from lineage.extract import source as source_mod
+
+    members = [f"M{i:02d}" for i in range(1, 11)]   # 10 members
+    session = _ifs_dead_session(members)
+    config = from_dict({
+        "scratch_lib": "QTEMP", "libraries": ["APPLIB"],
+        "source_files": [{"library": "APPLIB", "file": "QCLSRC"}],
+        "output_seeds": [{"id": "X", "library": "APPLIB", "file": "OUT1"}],
+        "liblists": {"default": ["APPLIB"]},
+    })
+    con = dbmod.connect(None)
+    counts = source_mod.harvest(session, con, config)
+
+    assert counts["source_strategy_demoted"] == 1
+    ifs_queries = [q for q in session.sql_log if "IFS_READ" in q]
+    # Exactly DEMOTE_AFTER_FALLBACKS wasted probes, then straight to alias.
+    assert len(ifs_queries) == source_mod.DEMOTE_AFTER_FALLBACKS
+    # Every member still retrieved.
+    assert dbmod.table_count(con, "raw_source_members") == len(members) * 2
+    con.close()
+
+
+def test_ifs_success_resets_demotion_counter():
+    from lineage.config import from_dict
+    from lineage.extract import source as source_mod
+    from lineage.extract.source import RetrievalStats, retrieve_member
+    from lineage.config import SourceFileRef
+
+    config = from_dict({
+        "scratch_lib": "QTEMP", "libraries": ["APPLIB"],
+        "source_files": [{"library": "APPLIB", "file": "QCLSRC"}],
+        "output_seeds": [{"id": "X", "library": "APPLIB", "file": "OUT1"}],
+        "liblists": {"default": ["APPLIB"]},
+    })
+    stats = RetrievalStats(consecutive_fallbacks=source_mod.DEMOTE_AFTER_FALLBACKS - 1)
+    src = SourceFileRef(library="APPLIB", file="QCLSRC")
+    session = FixtureHostSession(responses={
+        "source.text.APPLIB.QCLSRC.GOODMBR": QueryResult(
+            columns=["LINE_NUMBER", "LINE"], rows=[(1, "PGM")]),
+    })
+    lines, strategy = retrieve_member(session, src, "GOODMBR", config,
+                                      stats=stats)
+    assert strategy == "ifs_read"
+    assert stats.consecutive_fallbacks == 0     # reset, no demotion
+    assert not stats.demoted
+
+
+def test_explicit_ifs_read_mode_never_demotes():
+    import dataclasses
+
+    from lineage import db as dbmod
+    from lineage.config import from_dict
+    from lineage.extract import source as source_mod
+
+    members = [f"M{i:02d}" for i in range(1, 11)]
+    session = _ifs_dead_session(members)
+    config = from_dict({
+        "scratch_lib": "QTEMP", "libraries": ["APPLIB"],
+        "source_files": [{"library": "APPLIB", "file": "QCLSRC"}],
+        "output_seeds": [{"id": "X", "library": "APPLIB", "file": "OUT1"}],
+        "liblists": {"default": ["APPLIB"]},
+        "source_retrieval": "ifs_read",
+    })
+    con = dbmod.connect(None)
+    counts = source_mod.harvest(session, con, config)
+
+    assert "source_strategy_demoted" not in counts
+    ifs_queries = [q for q in session.sql_log if "IFS_READ" in q]
+    assert len(ifs_queries) == len(members)   # explicit mode: obeyed verbatim
+    con.close()

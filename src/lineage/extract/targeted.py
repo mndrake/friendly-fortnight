@@ -184,7 +184,7 @@ def harvest_targeted(session: HostSession, con, config: Config,
     from ..graph.build import build_graph
     from ..graph.resolve import backward_lineage
     from . import catalog, objinfo, xref
-    from .source import enumerate_members, retrieve_member
+    from .source import RetrievalStats, enumerate_members, retrieve_member
 
     p = progress or NULL
     counts: dict[str, int] = {}
@@ -245,8 +245,11 @@ def harvest_targeted(session: HostSession, con, config: Config,
     objstat_bulk: dict[tuple[str, str],
                        Optional[dict[str, Optional[tuple[str, str, str]]]]] = {}
     n_members_retrieved = 0
+    n_members_reused = 0
     n_source_lines = 0
     rounds_run = 0
+    retr_stats = RetrievalStats()
+    demotion_noted = False
     seen_files: set[tuple[str, str]] = set()   # (lib, name) already round-processed
     # Targeted mode must only ever narrow full mode's pulls: broad commands
     # (DSPPGMREF *ALL) never leave config.libraries in either
@@ -292,25 +295,49 @@ def harvest_targeted(session: HostSession, con, config: Config,
 
     def _retrieve_and_discover(lib: str, srcfile: str, member: str,
                                mtype: str | None, round_no: int) -> None:
-        nonlocal n_members_retrieved, n_source_lines
-        src_ref = SourceFileRef(library=lib, file=srcfile)
-        try:
-            lines, _strategy = retrieve_member(session, src_ref, member,
-                                               config, profile)
-        except Exception:  # noqa: BLE001
-            # Same rationale as _enumerate_cached: a discovered member that
-            # fails to read must not abort the extraction; the object shows
-            # up as missing_source at graph build.
-            enumeration_failures.add(f"{lib.upper()}/{srcfile.upper()}"
-                                     f"({member.upper()})")
-            return
-        rows = [(lib, srcfile, member, mtype, seq, text) for seq, text in lines]
-        n_members_retrieved += 1
-        p.tick("members retrieved", n_members_retrieved)
-        n_source_lines += insert_rows(
-            con, "raw_source_members",
-            ["library", "srcfile", "member", "member_type", "seq", "line_text"],
-            rows)
+        nonlocal n_members_retrieved, n_members_reused, n_source_lines, \
+            demotion_noted
+        # A member already in the store (a previous run that crashed or was
+        # killed, kept via `lineage extract --resume`) is not refetched from
+        # the host — its stored lines still feed name discovery below, so
+        # the slice closure rebuilds identically at local speed.
+        existing = con.execute(
+            "SELECT seq, line_text FROM raw_source_members WHERE "
+            "upper(library) = ? AND upper(srcfile) = ? AND upper(member) = ? "
+            "ORDER BY seq",
+            [lib.upper(), srcfile.upper(), member.upper()]).fetchall()
+        if existing:
+            n_members_reused += 1
+            lines: list[tuple[int, str]] = [
+                (int(seq), text or "") for seq, text in existing]
+        else:
+            src_ref = SourceFileRef(library=lib, file=srcfile)
+            try:
+                lines, _strategy = retrieve_member(session, src_ref, member,
+                                                   config, profile,
+                                                   stats=retr_stats)
+            except Exception:  # noqa: BLE001
+                # Same rationale as _enumerate_cached: a discovered member
+                # that fails to read must not abort the extraction; the
+                # object shows up as missing_source at graph build.
+                enumeration_failures.add(f"{lib.upper()}/{srcfile.upper()}"
+                                         f"({member.upper()})")
+                return
+            if retr_stats.demoted and not demotion_noted:
+                demotion_noted = True
+                p.note("IFS_READ demoted to alias for the rest of the run "
+                       f"after {retr_stats.consecutive_fallbacks} consecutive "
+                       "fallbacks (set source_retrieval: alias to make it "
+                       "permanent)")
+            rows = [(lib, srcfile, member, mtype, seq, text)
+                    for seq, text in lines]
+            n_members_retrieved += 1
+            p.tick("members retrieved", n_members_retrieved)
+            n_source_lines += insert_rows(
+                con, "raw_source_members",
+                ["library", "srcfile", "member", "member_type", "seq",
+                 "line_text"],
+                rows)
         new_names, src_hints = _discover_names(lib, srcfile, member, mtype,
                                                lines, con, config)
         for ref in src_hints:
@@ -380,7 +407,12 @@ def harvest_targeted(session: HostSession, con, config: Config,
             # entries discovered while processing this kind wait for the
             # next pass/round.
             pending: dict[str, list[str]] = {}
-            for lib, name in sorted(sl.of_kind(kind)):
+            # Library-less placeholders sort as (None, name) — a plain
+            # sorted() on mixed None/str libs is a TypeError (crashed a live
+            # 3-hour run); the key makes ordering total, the lib-check below
+            # still skips them.
+            for lib, name in sorted(sl.of_kind(kind),
+                                    key=lambda e: (e[0] or "", e[1])):
                 if lib and (kind, lib, name) not in src_locations:
                     pending.setdefault(lib, []).append(name)
             for lib, names in pending.items():
@@ -482,6 +514,11 @@ def harvest_targeted(session: HostSession, con, config: Config,
     counts["slice.programs"] = len(sl.of_kind("program"))
     counts["slice.files"] = len(sl.of_kind("file"))
     counts["slice.members_retrieved"] = n_members_retrieved
+    if n_members_reused:
+        counts["slice.members_reused"] = n_members_reused
+    if retr_stats.demoted:
+        # Make it permanent with `source_retrieval: alias` in config.yaml.
+        counts["slice.source_strategy_demoted"] = 1
     counts["slice.source_lines"] = n_source_lines
     counts["slice.total_objects"] = len(sl)
     counts["slice.source_files_discovered"] = (
