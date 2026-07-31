@@ -134,3 +134,26 @@ def test_ddl_table_confidence_and_provenance_in_summary(con, config):
     g = build_graph(con, config, phase=3)
     text = column_trace.trace_table(con, g, "APPLIB/DDLT")
     assert "COL1  → 1 base column, min confidence parsed" in text
+
+
+def test_resolve_target_falls_back_to_syscolumns_identity():
+    """A store whose extract pulled SYSCOLUMNS but not SYSTABLES for the
+    table (older runs) must still resolve identity — raw_syscolumns is the
+    same SQL catalog."""
+    from lineage import db as dbmod
+    from lineage.analyze.column_trace import resolve_target
+    from lineage.db import insert_rows
+
+    con = dbmod.connect(None)
+    insert_rows(con, "raw_syscolumns",
+                ["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal", "data_type", "length",
+                 "numeric_scale", "is_nullable", "column_heading"],
+                [("TNTACCDTA", "EDS_BROKER_BARGAIN_EVENING", "BROAST",
+                  "CACINM", "CACINM", 1, "DECIMAL", 9, 2, "N", "x")])
+    t = resolve_target(con, "TNTACCDTA/BROAST")
+    assert t.in_catalog          # found via syscolumns, not systables
+    assert t.name == "BROAST"    # canonical system name
+    assert t.spec == "TNTACCDTA/BROAST"
+    assert [c.sql_name for c in t.columns] == ["CACINM"]
+    con.close()

@@ -393,3 +393,45 @@ def test_standalone_sql_member_produces_column_derives_edges():
     assert ("column:TNTACCDTA/BROAST.CACINM",
             "column:TNTACCDTA/BARGAIN.ACINM") in derives
     con.close()
+
+
+def test_unqualified_sql_reference_resolves_via_syscolumns_identity():
+    """The liblist resolver must place an unqualified INSERT target whose
+    identity exists only in raw_syscolumns (no SYSTABLES row) — previously
+    this became an outside_scope gap and the writer never connected."""
+    import json as jsonmod
+
+    from lineage import db as dbmod
+    from lineage.config import from_dict
+    from lineage.db import insert_rows
+    from lineage.graph.build import build_graph
+
+    con = dbmod.connect(None)
+    insert_rows(con, "raw_syscolumns",
+                ["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal", "data_type", "length",
+                 "numeric_scale", "is_nullable", "column_heading"],
+                [("DTALIB", "BROAST", "BROAST", "CACINM", "CACINM", 1,
+                  "DECIMAL", 9, 2, "N", "x")])
+    a_row = ("APPLIB/WRITER", 1, "INSERT", None,
+             jsonmod.dumps([]), jsonmod.dumps(["BROAST"]),
+             jsonmod.dumps([]), jsonmod.dumps([]), None,
+             "INSERT INTO BROAST VALUES (?)")
+    con.execute(
+        "INSERT INTO parsed_sql_statements (program, seq, stmt_type, "
+        "ast_json, tables_read, tables_written, column_lineage, "
+        "columns_used, parse_error, raw_sql) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        list(a_row))
+    config = from_dict({
+        "scratch_lib": "QTEMP", "libraries": ["APPLIB"],
+        "output_seeds": [{"id": "B", "library": "DTALIB", "file": "BROAST"}],
+        "liblists": {"default": ["APPLIB", "DTALIB"]},
+    })
+    g = build_graph(con, config, phase=3)
+    writes = [(u, v) for u, v, d in g.edges(data=True)
+              if d.get("kind") == "writes"]
+    assert ("program:APPLIB/WRITER", "file:DTALIB/BROAST") in writes
+    gaps = con.execute(
+        "SELECT object_id FROM gaps WHERE kind = 'outside_scope'").fetchall()
+    assert not any("BROAST" in (o or "") for (o,) in gaps)
+    con.close()

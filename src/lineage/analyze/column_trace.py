@@ -87,7 +87,21 @@ def resolve_target(con, table_arg: str) -> Target:
         canonical = (system_name or table_name or name).upper()
         in_catalog = True
     else:
-        canonical, table_type, in_catalog = name, None, False
+        # raw_syscolumns is the same SQL catalog: a store from an extract
+        # that scope-pulled SYSCOLUMNS but not SYSTABLES (older runs) still
+        # proves the table exists and yields its canonical/system name.
+        cat_row = con.execute(
+            "SELECT table_name, system_name FROM raw_syscolumns "
+            "WHERE upper(table_schema) = ? "
+            "AND (upper(table_name) = ? OR upper(system_name) = ?) LIMIT 1",
+            [lib, name, name],
+        ).fetchone()
+        if cat_row is not None:
+            table_name, system_name = cat_row
+            canonical = (system_name or table_name or name).upper()
+            table_type, in_catalog = None, True
+        else:
+            canonical, table_type, in_catalog = name, None, False
 
     spec = f"{lib}/{canonical}"
 

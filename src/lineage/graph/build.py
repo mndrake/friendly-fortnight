@@ -129,6 +129,18 @@ class GraphBuilder:
                 self._catalog_objects.add((schema.upper(), label.upper()))
             kind_attr = {"table_type": ttype}
             self.add_file_node(schema, sysname or name, **kind_attr)
+        # raw_syscolumns is the same SQL catalog under another view: a store
+        # whose extract scope-pulled SYSCOLUMNS but not SYSTABLES (older
+        # runs) must still let the liblist resolver place unqualified
+        # references to those tables — identity hinging on SYSTABLES alone
+        # turned every such reference into an outside_scope gap.
+        for schema, name, sysname in self.con.execute(
+                "SELECT DISTINCT table_schema, table_name, system_name "
+                "FROM raw_syscolumns").fetchall():
+            if not schema:
+                continue
+            for label in {name, sysname} - {None}:
+                self._catalog_objects.add((schema.upper(), str(label).upper()))
         self.resolver = LiblistResolver(
             liblist=self.config.liblist(None),
             objects=self._catalog_objects,
