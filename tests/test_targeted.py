@@ -777,3 +777,85 @@ def test_full_mode_progress_lines(config, session, con):
     assert "DSPPGMREF APPLIB/*ALL ..." in text
     assert "DSPFFD APPLIB/*ALL: done in" in text
     assert "source APPLIB/QCLSRC: done in" in text
+
+
+# --- objstat batching: one library scan instead of a call per object ----------
+
+def test_objstat_bulk_scan_replaces_per_object_probes():
+    """25 slice programs in one library (>= OBJSTAT_BULK_THRESHOLD) must be
+    resolved by a single library-wide OBJECT_STATISTICS scan — the live run
+    was paying one JDBC round trip per object, a thousand-plus calls."""
+    from lineage.extract import targeted
+
+    caller_rows = [("TESTLIB", "WRITER", "TESTLIB", "OUT1", "F", "2", 1)]
+    caller_rows += [("TESTLIB", f"P{i:02d}", "TESTLIB", "WRITER", "PGM", "1", 1)
+                    for i in range(1, 25)]   # 24 callers + WRITER = 25 programs
+    bulk_rows = [("WRITER", "TESTLIB", "QCLSRC", "WRITER")]
+    bulk_rows += [(f"P{i:02d}", None, None, None) for i in range(1, 25)]
+    session = _synthetic_session(["WRITER"], extra_responses={
+        "xref.dsppgmref": QueryResult(
+            columns=["program_lib", "program_name", "object_lib",
+                     "object_name", "object_type", "usage_flag", "ref_count"],
+            rows=caller_rows),
+        "objstat.TESTLIB.pgm.bulk": QueryResult(
+            columns=["OBJNAME", "SOURCE_LIBRARY", "SOURCE_FILE",
+                     "SOURCE_MEMBER"],
+            rows=bulk_rows),
+    })
+    con = dbmod.connect(None)
+    counts = targeted.harvest_targeted(session, con, _synthetic_config())
+
+    bulk_queries = [q for q in session.sql_log
+                    if "OBJECT_STATISTICS('TESTLIB', '*PGM')" in q]
+    per_object_pgm = [q for q in session.sql_log
+                      if "'*PGM', '" in q]
+    assert len(bulk_queries) == 1        # one scan, cached across rounds
+    assert per_object_pgm == []          # no per-object program probes at all
+    assert counts["slice.objstat_bulk_scans"] >= 1
+    assert counts["slice.objstat_lookups"] >= 25
+    # The scan's hit still drives member retrieval as before.
+    members = {r[0] for r in con.execute(
+        "SELECT DISTINCT member FROM raw_source_members").fetchall()}
+    assert "WRITER" in members
+    src_ref = con.execute(
+        "SELECT source_ref FROM slice_objects WHERE kind='program' AND "
+        "name='WRITER'").fetchone()[0]
+    assert src_ref == "TESTLIB/QCLSRC(WRITER)"
+    con.close()
+
+
+def test_objstat_small_slice_keeps_per_object_probes(monkeypatch):
+    """Below the threshold the per-object probe (cheap, targeted) is kept —
+    a full scan of a huge library for two objects would be the regression."""
+    from lineage.extract import targeted
+
+    session = _synthetic_session(["WRITER"])
+    con = dbmod.connect(None)
+    counts = targeted.harvest_targeted(session, con, _synthetic_config())
+
+    assert not any(".bulk" in q or "'*PGM')" in q for q in session.sql_log
+                   if "OBJECT_STATISTICS" in q)
+    assert "slice.objstat_bulk_scans" not in counts
+    con.close()
+
+
+def test_objstat_bulk_scan_failure_falls_back_to_per_object(monkeypatch):
+    """A failed library scan (no fixture tag) must degrade to per-object
+    probing, not lose objstat discovery entirely."""
+    from lineage.extract import targeted
+
+    monkeypatch.setattr(targeted, "OBJSTAT_BULK_THRESHOLD", 1)
+    session = _synthetic_session(["WRITER"], extra_responses={
+        # No .bulk tag anywhere -> bulk scan raises -> cached as failed.
+        "objstat.TESTLIB.WRITER.pgm": QueryResult(
+            columns=["SOURCE_LIBRARY", "SOURCE_FILE", "SOURCE_MEMBER"],
+            rows=[("TESTLIB", "QCLSRC", "WRITER")]),
+    })
+    con = dbmod.connect(None)
+    targeted.harvest_targeted(session, con, _synthetic_config())
+
+    src_ref = con.execute(
+        "SELECT source_ref FROM slice_objects WHERE kind='program' AND "
+        "name='WRITER'").fetchone()[0]
+    assert src_ref == "TESTLIB/QCLSRC(WRITER)"   # per-object probe still won
+    con.close()

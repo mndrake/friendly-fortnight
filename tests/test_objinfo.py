@@ -59,3 +59,36 @@ def test_source_location_strips_whitespace():
     })
     assert source_location(session, "APPLIB", "RPT001", "*PGM") == (
         "APPLIB", "QRPGSRC", "RPT001")
+
+
+# --- Bulk (library-wide) scan --------------------------------------------------
+
+def test_bulk_scan_maps_every_object():
+    from lineage.extract.objinfo import source_locations_bulk
+
+    session = FixtureHostSession(responses={
+        "objstat.APPLIB.pgm.bulk": QueryResult(
+            # Uppercase labels, as a live JDBC result reports them.
+            columns=["OBJNAME", "SOURCE_LIBRARY", "SOURCE_FILE",
+                     "SOURCE_MEMBER"],
+            rows=[("RPT001", "APPLIB", "QRPGSRC", "RPT001"),
+                  ("RPT002", "APPLIB", "QRPGSRC", "RPT002SRC"),
+                  ("NOSRC", None, "  ", None)]),
+    })
+    locs = source_locations_bulk(session, "applib", "*PGM")
+    assert locs == {
+        "RPT001": ("APPLIB", "QRPGSRC", "RPT001"),
+        "RPT002": ("APPLIB", "QRPGSRC", "RPT002SRC"),
+        "NOSRC": None,          # exists, but no usable recorded source
+    }
+    assert "GHOST" not in locs   # absent == not in the library at all
+    # Exactly one host query: the whole-library scan.
+    assert len(session.sql_log) == 1
+    assert "OBJECT_STATISTICS('APPLIB', '*PGM')" in session.sql_log[0]
+
+
+def test_bulk_scan_failure_returns_none_not_empty():
+    from lineage.extract.objinfo import source_locations_bulk
+
+    session = FixtureHostSession(responses={})   # no fixture tag -> HostError
+    assert source_locations_bulk(session, "APPLIB", "*PGM") is None

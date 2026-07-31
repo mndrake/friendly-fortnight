@@ -64,6 +64,12 @@ from .progress import NULL, Progress
 
 MAX_ROUNDS = 5
 
+# At or above this many pending lookups in one (library, object type), the
+# objstat pass switches from per-object OBJECT_STATISTICS calls to a single
+# library-wide scan (see objinfo.source_locations_bulk). Below it, a scan of
+# a possibly-huge library costs more than a few targeted probes.
+OBJSTAT_BULK_THRESHOLD = 20
+
 
 def _add_prefixed(counts: dict[str, int], prefix: str, sub: dict[str, int]) -> None:
     for k, v in sub.items():
@@ -233,6 +239,11 @@ def harvest_targeted(session: HostSession, con, config: Config,
     # (kind, library, name) -> objinfo.source_location() result, once looked
     # up (None = probed, no hit). Absent key = not probed yet.
     src_locations: dict[tuple[str, str, str], Optional[tuple[str, str, str]]] = {}
+    # (library, obj_type) -> source_locations_bulk() result: one library-wide
+    # OBJECT_STATISTICS scan serves every lookup in that library for the
+    # whole run (None = the scan failed; per-object probing is used instead).
+    objstat_bulk: dict[tuple[str, str],
+                       Optional[dict[str, Optional[tuple[str, str, str]]]]] = {}
     n_members_retrieved = 0
     n_source_lines = 0
     rounds_run = 0
@@ -363,36 +374,62 @@ def harvest_targeted(session: HostSession, con, config: Config,
         # differ from the object name) from its recorded source file. -------
         n_probed_this_round = 0
         for kind, obj_type in (("program", "*PGM"), ("file", "*FILE")):
-            for lib, name in sl.of_kind(kind):
-                if not lib:
-                    continue
-                key = (kind, lib, name)
-                if key in src_locations:
-                    continue
-                loc = objinfo.source_location(session, lib, name, obj_type)
-                src_locations[key] = loc
-                n_probed_this_round += 1
-                # Rate-only tick: entries discovered mid-round join the work
-                # list live, so a fixed denominator would be a lie.
-                p.tick("objstat lookups", len(src_locations))
-                if loc is None:
-                    continue
-                srclib, srcfile, srcmbr = loc
-                _ensure_source_file(srclib, srcfile)
-                sl.set_source_ref(kind, lib, name,
-                                  f"{srclib}/{srcfile}({srcmbr})")
-                members = _enumerate_cached(srclib, srcfile)
-                mtype = None
-                for m in members:
-                    if (m.get("member") or "").upper() == srcmbr.upper():
-                        mtype = m.get("member_type")
-                        break
-                member_key = (srclib.upper(), srcfile.upper(), srcmbr.upper())
-                if member_key not in fetched_members:
-                    fetched_members.add(member_key)
-                    _retrieve_and_discover(srclib, srcfile, srcmbr, mtype,
-                                           round_no)
-                    did_anything = True
+            # Group this kind's pending lookups by library so each library
+            # can be answered by one bulk scan instead of a call per object.
+            # The snapshot matches the old per-object iteration semantics:
+            # entries discovered while processing this kind wait for the
+            # next pass/round.
+            pending: dict[str, list[str]] = {}
+            for lib, name in sorted(sl.of_kind(kind)):
+                if lib and (kind, lib, name) not in src_locations:
+                    pending.setdefault(lib, []).append(name)
+            for lib, names in pending.items():
+                bulk = objstat_bulk.get((lib, obj_type))
+                if (bulk is None and (lib, obj_type) not in objstat_bulk
+                        and len(names) >= OBJSTAT_BULK_THRESHOLD):
+                    p.start(f"objstat scan {lib} {obj_type}")
+                    bulk = objinfo.source_locations_bulk(session, lib,
+                                                         obj_type)
+                    # A failed scan is cached as None too: fall back to
+                    # per-object probes rather than rescanning every round.
+                    objstat_bulk[(lib, obj_type)] = bulk
+                    p.done(f"objstat scan {lib} {obj_type}",
+                           objects=len(bulk) if bulk is not None else "failed")
+                for name in names:
+                    key = (kind, lib, name)
+                    if key in src_locations:
+                        continue
+                    if bulk is not None:
+                        # Absent from an authoritative scan == no such
+                        # object == probed-and-missed.
+                        loc = bulk.get(name)
+                    else:
+                        loc = objinfo.source_location(session, lib, name,
+                                                      obj_type)
+                    src_locations[key] = loc
+                    n_probed_this_round += 1
+                    # Rate-only tick: entries discovered mid-round join the
+                    # work list live, so a fixed denominator would be a lie.
+                    p.tick("objstat lookups", len(src_locations))
+                    if loc is None:
+                        continue
+                    srclib, srcfile, srcmbr = loc
+                    _ensure_source_file(srclib, srcfile)
+                    sl.set_source_ref(kind, lib, name,
+                                      f"{srclib}/{srcfile}({srcmbr})")
+                    members = _enumerate_cached(srclib, srcfile)
+                    mtype = None
+                    for m in members:
+                        if (m.get("member") or "").upper() == srcmbr.upper():
+                            mtype = m.get("member_type")
+                            break
+                    member_key = (srclib.upper(), srcfile.upper(),
+                                  srcmbr.upper())
+                    if member_key not in fetched_members:
+                        fetched_members.add(member_key)
+                        _retrieve_and_discover(srclib, srcfile, srcmbr, mtype,
+                                               round_no)
+                        did_anything = True
 
         # -- Name-matching fallback: for slice objects objstat couldn't
         # place (no resolvable library, no hit, or a probe failure) and for
@@ -450,6 +487,9 @@ def harvest_targeted(session: HostSession, con, config: Config,
     counts["slice.source_files_discovered"] = (
         len(dynamic_source_files) - n_configured_source_files)
     counts["slice.libraries_discovered"] = len(libraries_discovered)
+    counts["slice.objstat_lookups"] = len(src_locations)
+    if objstat_bulk:
+        counts["slice.objstat_bulk_scans"] = len(objstat_bulk)
     if enumeration_failures:
         counts["slice.enumeration_failures"] = len(enumeration_failures)
     return counts
