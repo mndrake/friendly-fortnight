@@ -262,6 +262,42 @@ def analyze(config: str = _CONFIG_OPT) -> None:
 
 
 @app.command()
+def trace_columns(config: str = _CONFIG_OPT,
+                  table: str = typer.Option(
+                      ..., "--table", "-t",
+                      help="Target table as LIB/NAME (a DDL table). Its "
+                           "column lineage is traced from the built graph."),
+                  out: Optional[str] = typer.Option(
+                      None, help="Also write the rendered tree to this "
+                                 "file")) -> None:
+    """Trace column-level lineage of one selected output table as a tree.
+
+    Reads the already-built graph, so run `build` (phase 3) first. The target's
+    columns come from the SQL catalog (raw_syscolumns); each is traced backward
+    along column derives_from edges to its base-table columns.
+    """
+    cfg = _load(config)
+    con = _con(cfg)
+    try:
+        from .analyze import column_trace
+        from .graph.build import load_graph
+        g = load_graph(con)
+        try:
+            target = column_trace.resolve_target(con, table)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc))
+        text = column_trace.render_forest(target, g)
+        typer.echo(text)
+        if out:
+            out_path = Path(out)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(text, encoding="utf-8")
+            typer.echo(f"  written to {out_path}")
+    finally:
+        con.close()
+
+
+@app.command()
 def report(config: str = _CONFIG_OPT,
            out: str = typer.Option("data/report", help="Output directory"),
            fmt: str = typer.Option("csv", help="Table export format: csv|parquet")) -> None:

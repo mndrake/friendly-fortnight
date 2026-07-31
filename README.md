@@ -114,6 +114,24 @@ uv run lineage analyze          # per-output lineage, commonality, complexity
 uv run lineage report           # CSV/Parquet/JSON exports + summary.html
 ```
 
+### Tracing one table's columns
+
+To trace the column-level lineage of a single selected output table — without
+adding it to `output_seeds` — run, after `build` (phase 3):
+
+```sh
+uv run lineage trace-columns --config config.yaml --table APPLIB/MYTABLE
+```
+
+This assumes the target is a **DDL (SQL `CREATE TABLE`) table**: its column
+list is read from the SQL catalog (`raw_syscolumns`), and each column is walked
+backward along column `derives_from` edges to its base-table columns, rendered
+as a human-readable tree with the provenance/confidence of every hop. Columns
+with no resolvable upstream (constants, host-variable-fed inserts, unparsable
+SQL) are listed as `no resolved lineage` rather than dropped. Pass `--out FILE`
+to also save the tree. The table must already be extracted and built; for a
+table outside the current scan, seed a targeted extraction on it first.
+
 Set the password via `LINEAGE_DB_PASSWORD` rather than storing it in
 `config.yaml`.
 
