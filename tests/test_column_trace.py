@@ -1,0 +1,136 @@
+"""Tests for the single-table column-lineage extractor (analyze.column_trace)."""
+import json
+
+from lineage.analyze import column_trace
+
+
+# --- against the synthetic fixture estate ------------------------------------
+
+def test_ordext_columns_trace_to_orders_via_sql(built):
+    """ORDEXT is populated by SQLEXT's embedded
+    `INSERT INTO ORDEXT (ORDNO, AMT) SELECT ORDNO, AMOUNT FROM ORDERS`, so each
+    ORDEXT column resolves to its ORDERS source column at source_sql/parsed.
+    """
+    con, g = built
+    target = column_trace.resolve_target(con, "APPLIB/ORDEXT")
+    # DDL-style column enumeration comes from the SQL catalog (raw_syscolumns).
+    assert {c.sql_name for c in target.columns} == {"ORDNO", "AMT"}
+    assert target.node_id == "file:APPLIB/ORDEXT"
+
+    text = column_trace.render_forest(target, g)
+    assert "column:APPLIB/ORDERS.ORDNO" in text
+    assert "column:APPLIB/ORDERS.AMOUNT" in text
+    assert "source_sql" in text
+    assert "(base)" in text
+
+
+def test_ordext_ordno_tree_structure(built):
+    con, g = built
+    root = "column:APPLIB/ORDEXT.ORDNO"
+    tree = column_trace.trace_column(g, root)
+    assert tree.node == root
+    assert tree.provenance is None            # root has no incoming edge
+    assert not tree.is_base                   # it has an upstream
+    children = {c.node for c in tree.children}
+    assert "column:APPLIB/ORDERS.ORDNO" in children
+    src = next(c for c in tree.children
+               if c.node == "column:APPLIB/ORDERS.ORDNO")
+    assert src.provenance == "source_sql"
+    assert src.is_base                        # ORDERS.ORDNO has no upstream
+
+
+def test_custview_rename_traces_to_custmast(built):
+    """CUSTVIEW.CNAME maps to CUSTMAST.CUSTNAME through the view definition
+    (SELECT CUSTNO, CUSTNAME AS CNAME ...). CUSTVIEW has no SYSCOLUMNS rows in
+    the fixture, so columns fall back to the graph's own column nodes."""
+    con, g = built
+    text = column_trace.trace_table(con, g, "APPLIB/CUSTVIEW")
+    assert "column:APPLIB/CUSTMAST.CUSTNAME" in text
+    # It is a view, not a DDL table — the extractor says so but still traces.
+    assert "table_type" in text
+
+
+def test_unknown_table_reports_clearly(built):
+    con, g = built
+    text = column_trace.trace_table(con, g, "APPLIB/NOSUCHTBL")
+    assert "not found in raw_systables" in text
+
+
+def test_table_arg_accepts_sql_naming(built):
+    con, _ = built
+    dot = column_trace.resolve_target(con, "APPLIB.ORDEXT")
+    slash = column_trace.resolve_target(con, "APPLIB/ORDEXT")
+    assert dot.spec == slash.spec == "APPLIB/ORDEXT"
+
+
+# --- a genuine DDL table, built from hand-inserted rows -----------------------
+
+def test_ddl_table_columns_trace_to_base(con, config):
+    """A DDL (CREATE TABLE) table loaded by INSERT…SELECT: its columns trace
+    back to the base table's columns, and a column with no source is reported
+    as 'no resolved lineage'. Demonstrates the DDL (not DDS) case end to end.
+    """
+    from lineage.db import insert_rows
+    from lineage.graph.build import build_graph
+
+    insert_rows(con, "raw_systables",
+                ["table_schema", "table_name", "system_name", "table_type"],
+                [("APPLIB", "DDLT", "DDLT", "T"),      # DDL table (type T)
+                 ("APPLIB", "BASET", "BASET", "T")])
+    insert_rows(con, "raw_syscolumns",
+                ["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal"],
+                [("APPLIB", "DDLT", "DDLT", "COL1", "COL1", 1),
+                 ("APPLIB", "DDLT", "DDLT", "COL2", "COL2", 2),
+                 ("APPLIB", "DDLT", "DDLT", "COL3", "COL3", 3)])  # no source
+    insert_rows(con, "parsed_sql_statements",
+                ["program", "seq", "stmt_type", "ast_json", "tables_read",
+                 "tables_written", "column_lineage", "columns_used",
+                 "parse_error", "raw_sql"],
+                [("APPLIB/LOADPGM", 1, "INSERT", None,
+                  json.dumps(["APPLIB/BASET"]), json.dumps(["APPLIB/DDLT"]),
+                  json.dumps([
+                      {"target": "APPLIB/DDLT.COL1",
+                       "sources": ["APPLIB/BASET.SRCA"]},
+                      {"target": "APPLIB/DDLT.COL2",
+                       "sources": ["APPLIB/BASET.SRCB"]},
+                  ]),
+                  json.dumps([]), None,
+                  "INSERT INTO DDLT SELECT * FROM BASET")])
+
+    g = build_graph(con, config, phase=3)
+    target = column_trace.resolve_target(con, "APPLIB/DDLT")
+    assert target.table_type == "T"
+    assert [c.sql_name for c in target.columns] == ["COL1", "COL2", "COL3"]
+
+    text = column_trace.render_forest(target, g)
+    assert "column:APPLIB/BASET.SRCA" in text
+    assert "column:APPLIB/BASET.SRCB" in text
+    # COL3 has no upstream mapping -> surfaced, not dropped.
+    assert "COL3  → no resolved lineage" in text
+
+
+def test_ddl_table_confidence_and_provenance_in_summary(con, config):
+    from lineage.db import insert_rows
+    from lineage.graph.build import build_graph
+
+    insert_rows(con, "raw_systables",
+                ["table_schema", "table_name", "system_name", "table_type"],
+                [("APPLIB", "DDLT", "DDLT", "T")])
+    insert_rows(con, "raw_syscolumns",
+                ["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal"],
+                [("APPLIB", "DDLT", "DDLT", "COL1", "COL1", 1)])
+    insert_rows(con, "parsed_sql_statements",
+                ["program", "seq", "stmt_type", "ast_json", "tables_read",
+                 "tables_written", "column_lineage", "columns_used",
+                 "parse_error", "raw_sql"],
+                [("APPLIB/LOADPGM", 1, "INSERT", None,
+                  json.dumps(["APPLIB/BASET"]), json.dumps(["APPLIB/DDLT"]),
+                  json.dumps([{"target": "APPLIB/DDLT.COL1",
+                               "sources": ["APPLIB/BASET.SRCA"]}]),
+                  json.dumps([]), None, "INSERT INTO DDLT SELECT * FROM BASET")])
+
+    g = build_graph(con, config, phase=3)
+    text = column_trace.trace_table(con, g, "APPLIB/DDLT")
+    assert "COL1  → 1 base column, min confidence parsed" in text
