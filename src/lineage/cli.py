@@ -47,7 +47,14 @@ def extract(config: str = _CONFIG_OPT,
                      "already-harvested libraries, (library, file) pairs, "
                      "and source members are skipped, so a crashed or "
                      "killed targeted run continues where it left off. "
-                     "Targeted scope only.")) -> None:
+                     "Targeted scope only."),
+            host_log: Optional[str] = typer.Option(
+                None, "--host-log",
+                help="JSONL host-call log path (default: "
+                     "data/logs/host-calls-<timestamp>.jsonl). Every SQL "
+                     "query and CL command is logged with ISO timestamp, "
+                     "duration, tag, and error — queryable with DuckDB's "
+                     "read_json_auto for bottleneck analysis.")) -> None:
     """Pull catalogs, cross-references, and source members into the raw store."""
     cfg = _load(config)
     con = _con(cfg)
@@ -70,11 +77,21 @@ def extract(config: str = _CONFIG_OPT,
     else:
         from .extract.connection import open_session
         session = open_session(cfg.connection)
+    # Every host call is logged (timestamp, duration, tag, error) so a long
+    # run's exceptions and bottlenecks can be diagnosed after the fact.
+    from datetime import datetime
+
+    from .extract.calllog import HostCallLog, LoggingSession
+    log_path = host_log or (
+        f"data/logs/host-calls-{datetime.now():%Y%m%d-%H%M%S}.jsonl")
+    call_log = HostCallLog(log_path)
+    session = LoggingSession(session, call_log)
     # Live progress goes to stderr so the stdout count summary stays clean
-    # and scriptable; on a multi-minute host run this is the only sign of
-    # life until the final counts.
+    # and scriptable; wall-clock stamps let progress lines line up with the
+    # host-call log's timestamps.
     from .extract.progress import Progress
-    prog = Progress(echo=lambda s: typer.echo(s, err=True))
+    prog = Progress(echo=lambda s: typer.echo(s, err=True),
+                    stamp=lambda: datetime.now().strftime("%H:%M:%S"))
     try:
         from .extract import catalog, hostinfo, source, targeted, xref
         if resume:
@@ -115,6 +132,9 @@ def extract(config: str = _CONFIG_OPT,
     finally:
         prog.close()
         session.close()
+        for line in call_log.summary_lines():
+            typer.echo(line, err=True)
+        call_log.close()
         con.close()
 
 
@@ -424,7 +444,8 @@ def run(config: str = _CONFIG_OPT,
             None, help="Extraction scope: full|targeted "
                        "(default: config's extraction_scope)")) -> None:
     """extract → parse → build → analyze → report, end to end."""
-    extract(config=config, fixture_dir=fixture_dir, scope=scope, resume=False)
+    extract(config=config, fixture_dir=fixture_dir, scope=scope, resume=False,
+            host_log=None)
     parse(config=config)
     build(config=config, phase=phase)
     analyze(config=config)

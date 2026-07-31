@@ -48,16 +48,26 @@ class Progress:
 
     def __init__(self, echo: Optional[Callable[[str], None]] = None,
                  clock: Callable[[], float] = time.monotonic,
-                 min_interval: float = 1.0):
+                 min_interval: float = 1.0,
+                 stamp: Optional[Callable[[], str]] = None):
         self.echo = echo
         self.clock = clock
         self.min_interval = min_interval
+        # Optional wall-clock stamp prefixed to every line ("[HH:MM:SS] ").
+        # The CLI passes one so progress lines correlate with the
+        # timestamped host-call log when troubleshooting a long run.
+        self.stamp = stamp
         self._run_start: Optional[float] = None
         self._phase: Optional[str] = None
         self._phase_start: float = 0.0
         self._starts: dict[str, float] = {}
         # label -> (first_ts, first_done, last_print_ts)
         self._ticks: dict[str, tuple[float, int, float]] = {}
+
+    def _emit(self, line: str) -> None:
+        if self.stamp is not None:
+            line = f"[{self.stamp()}] {line}"
+        self.echo(line)
 
     def _now(self) -> float:
         now = self.clock()
@@ -72,19 +82,19 @@ class Progress:
         self._close_phase(now)
         self._phase = name
         self._phase_start = now
-        self.echo(f"== {name}")
+        self._emit(f"== {name}")
 
     def note(self, msg: str) -> None:
         if self.echo is None:
             return
         self._now()
-        self.echo(f"  {msg}")
+        self._emit(f"  {msg}")
 
     def start(self, label: str) -> None:
         if self.echo is None:
             return
         self._starts[label] = self._now()
-        self.echo(f"  {label} ...")
+        self._emit(f"  {label} ...")
 
     def done(self, label: str, **info: Any) -> None:
         if self.echo is None:
@@ -94,7 +104,7 @@ class Progress:
         suffix = ""
         if info:
             suffix = " (" + ", ".join(f"{k}={v}" for k, v in info.items()) + ")"
-        self.echo(f"  {label}: done in {_fmt_duration(elapsed)}{suffix}")
+        self._emit(f"  {label}: done in {_fmt_duration(elapsed)}{suffix}")
 
     def tick(self, label: str, done: int, total: Optional[int] = None) -> None:
         if self.echo is None:
@@ -105,7 +115,7 @@ class Progress:
             # First tick is the rate baseline: always printed, never rated
             # (zero elapsed would make any rate meaningless).
             self._ticks[label] = (now, done, now)
-            self.echo(f"  {label}: {done}/{total}" if total is not None
+            self._emit(f"  {label}: {done}/{total}" if total is not None
                       else f"  {label}: {done}")
             return
         first_ts, first_done, last_print = state
@@ -126,7 +136,7 @@ class Progress:
             else:
                 line = f"  {label}: {done}"
         self._ticks[label] = (first_ts, first_done, now)
-        self.echo(line)
+        self._emit(line)
 
     def close(self) -> None:
         if self.echo is None:
@@ -134,11 +144,11 @@ class Progress:
         now = self.clock()
         self._close_phase(now)
         if self._run_start is not None:
-            self.echo(f"total elapsed {_fmt_duration(now - self._run_start)}")
+            self._emit(f"total elapsed {_fmt_duration(now - self._run_start)}")
 
     def _close_phase(self, now: float) -> None:
         if self._phase is not None:
-            self.echo(f"== {self._phase} done in "
+            self._emit(f"== {self._phase} done in "
                       f"{_fmt_duration(now - self._phase_start)}")
             self._phase = None
 
