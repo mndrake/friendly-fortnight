@@ -285,6 +285,16 @@ def harvest(session: HostSession, con, config,
             sys_col_spec = next(
                 (c for c in spec.cols if c.raw == "system_name"), None)
             alt_col = sys_col_spec.pick(available) if sys_col_spec else None
+            # An incomplete catalog self-description must not silently
+            # reduce matching to SQL names: slice pairs are system names,
+            # so without the OR-clause a scoped pull returns nothing (live
+            # symptom: 0 SYSTABLES rows despite thousands of pairs). Try
+            # the documented system-name column even when the profile
+            # doesn't report it; if the host genuinely rejects it, retry
+            # the pull without it.
+            speculative = sys_col_spec is not None and alt_col is None
+            if speculative:
+                alt_col = sys_col_spec.candidates[0]
 
             def _wanted(r: tuple) -> bool:
                 lib_u = str(r[0] or "").upper()
@@ -297,15 +307,35 @@ def harvest(session: HostSession, con, config,
             rows: list[tuple] = []
             missing: list[str] = []
             p.start(f"catalog {spec.name} ({len(todo)} pairs)")
-            for frag in pairs_filter(spec.schema_filter, "TABLE_NAME", todo,
-                                     alt_name_col=alt_col):
-                # No TABLE_SCHEMA IN (...) conjunct here: the pairs already
-                # pin exact (schema, name) scope, so a slice object in a
-                # library outside config.libraries is still reachable
-                # (library_discovery: slice — see extract/targeted.py).
-                sql, missing = spec.build_select(available, None, extra_where=frag)
-                res = _fetch(session, f"catalog.{spec.name}", sql)
-                rows.extend(tuple(r) for r in res.rows if _wanted(r))
+            for attempt in ([alt_col, None] if speculative else [alt_col]):
+                # The speculative column must be genuinely SELECTed too —
+                # NULL-filling it would make the row filter reject every
+                # system-name match the WHERE just found.
+                sel_available = (available | {attempt}
+                                 if available and attempt else available)
+                rows_try: list[tuple] = []
+                missing_try: list[str] = []
+                try:
+                    for frag in pairs_filter(spec.schema_filter, "TABLE_NAME",
+                                             todo, alt_name_col=attempt):
+                        # No TABLE_SCHEMA IN (...) conjunct here: the pairs
+                        # already pin exact (schema, name) scope, so a slice
+                        # object in a library outside config.libraries is
+                        # still reachable (library_discovery: slice — see
+                        # extract/targeted.py).
+                        sql, missing_try = spec.build_select(
+                            sel_available, None, extra_where=frag)
+                        res = _fetch(session, f"catalog.{spec.name}", sql)
+                        rows_try.extend(tuple(r) for r in res.rows
+                                        if _wanted(tuple(r)))
+                except CatalogShapeError:
+                    raise
+                except Exception:  # noqa: BLE001 - retry without speculation
+                    if attempt is None or not speculative:
+                        raise
+                    continue
+                rows, missing = rows_try, missing_try
+                break
             if missing:
                 counts[f"{spec.name}_missing_columns"] = len(missing)
             counts[spec.raw_table] = insert_rows(

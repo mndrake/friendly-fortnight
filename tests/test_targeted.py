@@ -1117,3 +1117,77 @@ def test_perfile_failure_notes_are_throttled():
     assert len(failure_notes) == xref._MAX_FAILURE_NOTES
     assert sum("suppressed" in ln for ln in out) == 1
     con.close()
+
+
+# --- Incomplete catalog self-description must not kill system-name matching ----
+
+def _profile_without_systables_sysname():
+    from lineage.extract.hostinfo import HostProfile
+
+    return HostProfile(catalog_columns={
+        "SYSTABLES": {"TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE"},
+        "SYSCOLUMNS": {"TABLE_SCHEMA", "TABLE_NAME", "SYSTEM_TABLE_NAME",
+                       "COLUMN_NAME", "SYSTEM_COLUMN_NAME",
+                       "ORDINAL_POSITION"},
+    })
+
+
+def test_scoped_pull_speculates_system_name_despite_profile():
+    """The live probe under-reported SYSTABLES' columns; the scoped pull must
+    still try SYSTEM_TABLE_NAME (documented) — and genuinely SELECT it, so
+    the row filter can accept system-name matches."""
+    from lineage.extract import catalog
+
+    session = FixtureHostSession(responses={
+        "catalog.systables": QueryResult(
+            columns=["table_schema", "table_name", "system_name",
+                     "table_type", "file_type", "row_count", "long_comment"],
+            rows=[("TNTACCDTA", "EDS_BROKER_BARGAIN_EVENING", "BROAST",
+                   "T", "D", 1, None)]),
+    })
+    con = dbmod.connect(None)
+    counts = catalog.harvest(
+        session, con, _synthetic_config(),
+        profile=_profile_without_systables_sysname(),
+        only={"SYSTABLES": [("TNTACCDTA", "BROAST")], "SYSCOLUMNS": [],
+              "SYSPARTITIONSTAT": [], "SYSVIEWS": [], "SYSVIEWDEP": []})
+
+    assert counts["raw_systables"] == 1
+    sql = next(q for q in session.sql_log if "SYSTABLES" in q)
+    assert "SYSTEM_TABLE_NAME = 'BROAST'" in sql       # speculative OR-clause
+    assert "SYSTEM_TABLE_NAME AS system_name" in sql   # ...and SELECTed
+    con.close()
+
+
+def test_speculative_system_name_retries_without_on_host_rejection():
+    """If the host genuinely lacks the column (SQL0206), the pull retries
+    without it instead of failing the extraction."""
+    from lineage.extract import catalog
+    from lineage.extract.connection import HostError
+
+    class _RejectsSysname(FixtureHostSession):
+        def query(self, sql, params=()):
+            if "SYSTEM_TABLE_NAME" in sql:
+                self.sql_log.append(sql)
+                self._last_tag = None
+                raise HostError("[SQL0206] SYSTEM_TABLE_NAME not valid.")
+            return super().query(sql)
+
+    session = _RejectsSysname(responses={
+        "catalog.systables": QueryResult(
+            columns=["table_schema", "table_name", "system_name",
+                     "table_type", "file_type", "row_count", "long_comment"],
+            rows=[("TNTACCDTA", "BROAST", None, "T", "D", 1, None)]),
+    })
+    con = dbmod.connect(None)
+    counts = catalog.harvest(
+        session, con, _synthetic_config(),
+        profile=_profile_without_systables_sysname(),
+        only={"SYSTABLES": [("TNTACCDTA", "BROAST")], "SYSCOLUMNS": [],
+              "SYSPARTITIONSTAT": [], "SYSVIEWS": [], "SYSVIEWDEP": []})
+
+    assert counts["raw_systables"] == 1    # matched by plain TABLE_NAME
+    assert any("SYSTEM_TABLE_NAME" in q for q in session.sql_log)   # tried
+    assert any("SYSTEM_TABLE_NAME" not in q and "SYSTABLES" in q
+               for q in session.sql_log)                            # retried
+    con.close()
