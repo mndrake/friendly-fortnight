@@ -343,6 +343,75 @@ def report(config: str = _CONFIG_OPT,
         con.close()
 
 
+@app.command(name="sql-errors")
+def sql_errors(config: str = _CONFIG_OPT,
+               limit: int = typer.Option(
+                   10, help="How many error signatures to display"),
+               samples: int = typer.Option(
+                   2, help="Sample statements shown per signature"),
+               out: Optional[str] = typer.Option(
+                   "data/sql_parse_errors.csv",
+                   help="Write every errored statement to this CSV "
+                        "(pass '' to skip)")) -> None:
+    """Summarize recorded SQL parse errors: parser gaps vs. broken source.
+
+    Statements are grouped by normalized error signature so a systemic
+    parser gap (one DB2-ism repeated hundreds of times — worth fixing in
+    parse/embedded_sql.py) stands out from genuinely malformed source.
+    'Partially parsed' rows are the DDL name-level fallback: the created
+    table and CTAS sources were kept at inferred confidence; only
+    column-level detail was lost.
+    """
+    import csv
+    import re as remod
+
+    cfg = _load(config)
+    con = _con(cfg)
+    try:
+        rows = con.execute(
+            "SELECT program, seq, stmt_type, parse_error, raw_sql "
+            "FROM parsed_sql_statements WHERE parse_error IS NOT NULL "
+            "ORDER BY program, seq").fetchall()
+        if not rows:
+            typer.echo("no SQL parse errors recorded")
+            return
+        failed = [r for r in rows if r[2] == "PARSE_ERROR"]
+        partial = [r for r in rows if r[2] != "PARSE_ERROR"]
+        typer.echo(f"{len(rows)} statements carry a parse error:")
+        typer.echo(f"  {len(partial)} partially parsed (DDL fallback — "
+                   "table-level lineage kept, column detail lost)")
+        typer.echo(f"  {len(failed)} failed outright (no lineage extracted)")
+
+        def signature(err: str) -> str:
+            first = (err or "").strip().splitlines()[0]
+            first = remod.sub(r"Line \d+, Col: \d+", "Line _, Col _", first)
+            first = remod.sub(r"'[^']{40,}'", "'…'", first)
+            return first[:160]
+
+        groups: dict[str, list] = {}
+        for r in rows:
+            groups.setdefault(signature(r[3]), []).append(r)
+        shown = sorted(groups.items(), key=lambda kv: -len(kv[1]))[:limit]
+        typer.echo(f"error signatures ({len(shown)} of {len(groups)}, "
+                   "most frequent first):")
+        for sig_text, members in shown:
+            typer.echo(f"  [{len(members):4d}x] {sig_text}")
+            for prog, seq, stype, _err, raw in members[:samples]:
+                one_line = " ".join((raw or "").split())[:140]
+                typer.echo(f"          {prog} #{seq} ({stype}): {one_line}")
+        if out:
+            out_path = Path(out)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with out_path.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(["program", "seq", "stmt_type",
+                                 "parse_error", "raw_sql"])
+                writer.writerows(rows)
+            typer.echo(f"full list: {out_path}")
+    finally:
+        con.close()
+
+
 @app.command()
 def run(config: str = _CONFIG_OPT,
         fixture_dir: Optional[str] = typer.Option(None),
