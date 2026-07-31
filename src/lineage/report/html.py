@@ -63,15 +63,17 @@ def render(con, coverage: dict, out_path: str | Path) -> Path:
         "WHERE relation = 'used' GROUP BY output_id").fetchall())
     parts.append("<h2>Output coverage</h2><table><tr><th>Output</th>"
                  "<th>Status</th><th>Base physical files</th>"
-                 "<th>Cols used</th><th>Reasons</th></tr>")
+                 "<th>Cols used</th><th>Reasons</th><th>Lineage view</th></tr>")
     for oid in sorted(outputs):
         o = outputs[oid]
         files = "<br>".join(f"<code>{_esc(f)}</code>" for f in o["base_files"]) or "—"
+        page = f"lineage_{oid}.html"
         parts.append(
             f"<tr><td>{_esc(oid)}</td>"
             f"<td class='status-{o['status']}'>{_esc(o['status'])}</td>"
             f"<td>{files}</td><td>{cols_used.get(oid, 0)}</td>"
-            f"<td>{_esc('; '.join(o['reasons']) or '')}</td></tr>")
+            f"<td>{_esc('; '.join(o['reasons']) or '')}</td>"
+            f"<td><a href='{_esc(page)}'>view</a></td></tr>")
     parts.append("</table>")
 
     # Complexity buckets

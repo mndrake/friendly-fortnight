@@ -322,7 +322,7 @@ def report(config: str = _CONFIG_OPT,
     try:
         from .analyze.gaps import coverage
         from .graph.build import load_graph
-        from .report import export, html as html_report
+        from .report import export, html as html_report, viewer
         cov = coverage(con, cfg)
         out_dir = Path(out)
         written = export.export_tables(con, out_dir, fmt=fmt)
@@ -331,9 +331,13 @@ def report(config: str = _CONFIG_OPT,
         (out_dir / "coverage.json").write_text(
             json.dumps(cov, indent=2, sort_keys=True), encoding="utf-8")
         html_path = html_report.render(con, cov, out_dir / "summary.html")
+        pages = viewer.render_output_pages(con, g, cfg, out_dir)
         typer.echo(f"  tables: {len(written)} files")
         typer.echo(f"  coverage: {out_dir / 'coverage.json'}")
         typer.echo(f"  html: {html_path}")
+        typer.echo(f"  lineage pages: {len(pages)} files")
+        for p in pages:
+            typer.echo(f"    {p}")
         s = cov["summary"]
         typer.echo(
             f"  outputs resolved {s['outputs_resolved']}/{s['outputs_total']} "
