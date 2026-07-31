@@ -189,14 +189,20 @@ def _quote(v: str) -> str:
 
 
 def pairs_filter(schema_col: str, name_col: str,
-                 pairs: Sequence[tuple[str, str]], chunk: int = 500
-                 ) -> list[str]:
+                 pairs: Sequence[tuple[str, str]], chunk: int = 500,
+                 alt_name_col: str | None = None) -> list[str]:
     """Chunk ``(schema, name)`` pairs into ``OR``-of-``AND`` WHERE fragments.
 
     Each fragment looks like::
 
         ((SCHEMA_COL = 'LIB1' AND NAME_COL = 'NAME1') OR
          (SCHEMA_COL = 'LIB2' AND NAME_COL = 'NAME2') OR ...)
+
+    ``alt_name_col`` (e.g. ``SYSTEM_TABLE_NAME``) widens each name test to
+    ``(NAME_COL = 'N' OR ALT_COL = 'N')``: slice pairs come from DSPPGMREF
+    and parsed RPG/CL, which reference DDL tables by their 10-char *system*
+    names, while the catalog's ``TABLE_NAME`` holds the long SQL name — a
+    name-only match would silently miss every long-named DDL table.
 
     Returns one fragment per ``chunk``-sized slice of ``pairs`` (so a caller
     issues one SELECT per fragment and concatenates the rows) — keeps any
@@ -206,10 +212,15 @@ def pairs_filter(schema_col: str, name_col: str,
     pairs = list(pairs)
     for i in range(0, len(pairs), chunk):
         batch = pairs[i:i + chunk]
-        ors = " OR ".join(
-            f"({schema_col} = {_quote(lib)} AND {name_col} = {_quote(name)})"
-            for lib, name in batch)
-        fragments.append(f"({ors})")
+        parts = []
+        for lib, name in batch:
+            q = _quote(name)
+            if alt_name_col:
+                name_test = f"({name_col} = {q} OR {alt_name_col} = {q})"
+            else:
+                name_test = f"{name_col} = {q}"
+            parts.append(f"({schema_col} = {_quote(lib)} AND {name_test})")
+        fragments.append(f"({' OR '.join(parts)})")
     return fragments
 
 
@@ -250,34 +261,51 @@ def harvest(session: HostSession, con, config,
             # targeted rounds stay idempotent, and a fixture session (which
             # serves the same canned response for every chunk) cannot smuggle
             # extra rows in. Raw column 0/1 are the schema/name columns for
-            # every scopable view.
-            lib_col, name_col = RAW_COLUMNS[spec.raw_table][:2]
-            existing = {
-                ((l or "").upper(), (n or "").upper())
-                for l, n in con.execute(
-                    f"SELECT DISTINCT {lib_col}, {name_col} "
-                    f"FROM {spec.raw_table}").fetchall()
-            }
+            # every scopable view; slice pairs carry 10-char *system* names,
+            # so matching (dedup, SQL WHERE, and row filtering alike) accepts
+            # the system-name column as an alias of the SQL name throughout.
+            raw_cols = RAW_COLUMNS[spec.raw_table]
+            lib_col, name_col = raw_cols[:2]
+            sys_idx = (raw_cols.index("system_name")
+                       if "system_name" in raw_cols else None)
+            existing: set[tuple[str, str]] = set()
+            sys_sel = f", {raw_cols[sys_idx]}" if sys_idx is not None else ""
+            for row in con.execute(
+                    f"SELECT DISTINCT {lib_col}, {name_col}{sys_sel} "
+                    f"FROM {spec.raw_table}").fetchall():
+                lib_u = (row[0] or "").upper()
+                existing.add((lib_u, (row[1] or "").upper()))
+                if sys_idx is not None and row[2]:
+                    existing.add((lib_u, str(row[2]).upper()))
             todo_set = {(l.upper(), n.upper()) for l, n in pairs} - existing
             todo = sorted(todo_set)
             if not todo:
                 counts[spec.raw_table] = 0
                 continue
+            sys_col_spec = next(
+                (c for c in spec.cols if c.raw == "system_name"), None)
+            alt_col = sys_col_spec.pick(available) if sys_col_spec else None
+
+            def _wanted(r: tuple) -> bool:
+                lib_u = str(r[0] or "").upper()
+                if (lib_u, str(r[1] or "").upper()) in todo_set:
+                    return True
+                return (sys_idx is not None and sys_idx < len(r)
+                        and r[sys_idx] is not None
+                        and (lib_u, str(r[sys_idx]).upper()) in todo_set)
+
             rows: list[tuple] = []
             missing: list[str] = []
             p.start(f"catalog {spec.name} ({len(todo)} pairs)")
-            for frag in pairs_filter(spec.schema_filter, "TABLE_NAME", todo):
+            for frag in pairs_filter(spec.schema_filter, "TABLE_NAME", todo,
+                                     alt_name_col=alt_col):
                 # No TABLE_SCHEMA IN (...) conjunct here: the pairs already
                 # pin exact (schema, name) scope, so a slice object in a
                 # library outside config.libraries is still reachable
                 # (library_discovery: slice — see extract/targeted.py).
                 sql, missing = spec.build_select(available, None, extra_where=frag)
                 res = _fetch(session, f"catalog.{spec.name}", sql)
-                rows.extend(
-                    tuple(r) for r in res.rows
-                    if (str(r[0] or "").upper(), str(r[1] or "").upper())
-                    in todo_set
-                )
+                rows.extend(tuple(r) for r in res.rows if _wanted(r))
             if missing:
                 counts[f"{spec.name}_missing_columns"] = len(missing)
             counts[spec.raw_table] = insert_rows(

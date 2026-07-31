@@ -208,11 +208,25 @@ def test_slice_placeholder_upgrade_reports_change():
 
 # --- Targeted mode never touches unconfigured libraries ------------------------
 
+def _syscolumns_rows(*files: tuple[str, str]) -> QueryResult:
+    """Raw-shaped SYSCOLUMNS response giving each (lib, file) one column —
+    enough for the catalog-presence check that gates per-file DSP commands
+    (a real database file always has catalog columns on the live host)."""
+    return QueryResult(
+        columns=["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal", "data_type", "length",
+                 "numeric_scale", "is_nullable", "column_heading"],
+        rows=[(lib, f, f, "FLD1", "FLD1", 1, "DECIMAL", 9, 0, "N", "FLD1")
+              for lib, f in files])
+
+
 def _otherlib_responses() -> dict[str, QueryResult]:
     responses: dict[str, QueryResult] = {}
     for tag in ("catalog.systables", "catalog.sysviews", "catalog.sysviewdep",
-               "catalog.syscolumns", "catalog.syspartitionstat"):
+               "catalog.syspartitionstat"):
         responses[tag] = QueryResult(columns=["a"], rows=[])
+    responses["catalog.syscolumns"] = _syscolumns_rows(
+        ("TESTLIB", "OUT1"), ("OTHERLIB", "EXTFILE"))
     responses["xref.dsppgmref"] = QueryResult(
         columns=["program_lib", "program_name", "object_lib", "object_name",
                  "object_type", "usage_flag", "ref_count"],
@@ -919,4 +933,58 @@ def test_unscoped_catalog_pull_is_idempotent(config, session):
     second = catalog.harvest(session2, con, config, profile)
     assert dbmod2.table_count(con, "raw_systables") == before
     assert second["raw_systables"] == 0
+    con.close()
+
+
+# --- Catalog-presence gate: doomed per-file DSP commands are never issued -----
+
+def test_targeted_skips_files_absent_from_catalog():
+    """A slice file with no catalog columns (device file, phantom library,
+    deleted object) gets no DSPFFD/DSPDBR at all — the live estate was
+    paying a failed host call per pair (CPF3064/CPF3010 spam)."""
+    from lineage.extract import targeted
+
+    session = _synthetic_session(["WRITER"])   # syscolumns fixture is empty
+    con = dbmod.connect(None)
+    counts = targeted.harvest_targeted(session, con, _synthetic_config())
+
+    assert not any(c.startswith(("DSPFFD", "DSPDBR")) for c in session.cl_log)
+    assert counts["slice.nondb_files_skipped"] >= 1
+    sl = _slice_rows(con)
+    assert ("file", "TESTLIB", "OUT1") in sl   # still audited, still sliced
+    con.close()
+
+
+def test_scoped_catalog_pull_matches_system_names():
+    """DSPPGMREF/RPG reference DDL tables by 10-char system names; the
+    scoped SYSCOLUMNS pull must match SYSTEM_TABLE_NAME too, or every
+    long-named DDL table silently loses its columns."""
+    from lineage import db as dbmod2
+    from lineage.extract import catalog
+
+    session = FixtureHostSession(responses={
+        "catalog.syscolumns": QueryResult(
+            columns=["table_schema", "table_name", "system_name",
+                     "column_name", "system_column", "ordinal", "data_type",
+                     "length", "numeric_scale", "is_nullable",
+                     "column_heading"],
+            rows=[("APPLIB", "CUSTOMER_REPORT", "CUSTRP0001", "CUSTNO",
+                   "CUSTNO", 1, "DECIMAL", 9, 0, "N", "CUSTNO")]),
+    })
+    con = dbmod.connect(None)
+    config = _synthetic_config()
+    only = {"SYSCOLUMNS": [("APPLIB", "CUSTRP0001")],
+            "SYSPARTITIONSTAT": [], "SYSTABLES": [], "SYSVIEWS": [],
+            "SYSVIEWDEP": []}
+    counts = catalog.harvest(session, con, config, only=only)
+
+    assert counts["raw_syscolumns"] == 1     # matched via system name
+    assert any("SYSTEM_TABLE_NAME = 'CUSTRP0001'" in q
+               for q in session.sql_log)
+    # Idempotent under the system name too: the second call must recognise
+    # the stored long-name rows as covering the system-named pair.
+    session2 = FixtureHostSession(responses=session._responses)
+    counts2 = catalog.harvest(session2, con, config, only=only)
+    assert counts2["raw_syscolumns"] == 0
+    assert dbmod2.table_count(con, "raw_syscolumns") == 1
     con.close()

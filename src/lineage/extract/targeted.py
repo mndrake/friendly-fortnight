@@ -160,6 +160,25 @@ def _parse_node_id(node_id: str) -> Optional[tuple[str, Optional[str], str]]:
     return kind, lib, name.upper()
 
 
+def _catalog_present_pairs(con) -> set[tuple[str, str]]:
+    """(LIB, NAME) pairs the catalog has columns for, under both SQL and
+    system names. A slice file absent from this set is not a database file
+    on the host — a device file, a phantom library from a stale compiled
+    reference, or a deleted object — so per-file DSPFFD/DSPDBR against it
+    can only fail (CPF3064/CPF3010) and is skipped without a host call.
+    """
+    present: set[tuple[str, str]] = set()
+    for schema, name, sysname in con.execute(
+            "SELECT DISTINCT table_schema, table_name, system_name "
+            "FROM raw_syscolumns").fetchall():
+        lib = (schema or "").upper()
+        if name:
+            present.add((lib, str(name).upper()))
+        if sysname:
+            present.add((lib, str(sysname).upper()))
+    return present
+
+
 def _resolve_unqualified(con, config: Config, name: str) -> Optional[str]:
     """Best-effort library resolution for an unqualified (*LIBL) name against
     the catalog already loaded (raw_systables) and the default liblist.
@@ -377,11 +396,28 @@ def harvest_targeted(session: HostSession, con, config: Config,
                 session, con, config, profile,
                 only={"SYSCOLUMNS": new_files, "SYSPARTITIONSTAT": new_files},
                 progress=progress))
-            _add_prefixed(counts, "xref", xref.harvest_ffd(
-                session, con, config, files=new_files, progress=progress))
-            dbr_counts = xref.harvest_dbr(session, con, config,
-                                          files=new_files, progress=progress)
-            _add_prefixed(counts, "xref", dbr_counts)
+            # Only files the catalog just confirmed (columns present under
+            # either name) get per-file DSP commands; the rest would fail
+            # with CPF3064/CPF3010 — pure wasted host calls on a big slice.
+            # Skipped files stay in the slice for the audit trail and
+            # name-matched source discovery, surfacing as gaps at build.
+            present = _catalog_present_pairs(con)
+            db_files = [pr for pr in new_files
+                        if (pr[0].upper(), pr[1].upper()) in present]
+            skipped_nondb = len(new_files) - len(db_files)
+            if skipped_nondb:
+                counts["slice.nondb_files_skipped"] = (
+                    counts.get("slice.nondb_files_skipped", 0) + skipped_nondb)
+                p.note(f"{skipped_nondb} slice files have no catalog columns "
+                       "(device files, phantom libraries, or deleted "
+                       "objects) — DSPFFD/DSPDBR skipped for them")
+            if db_files:
+                _add_prefixed(counts, "xref", xref.harvest_ffd(
+                    session, con, config, files=db_files, progress=progress))
+                dbr_counts = xref.harvest_dbr(session, con, config,
+                                              files=db_files,
+                                              progress=progress)
+                _add_prefixed(counts, "xref", dbr_counts)
 
             based_on = con.execute(
                 "SELECT dep_lib, dep_file, based_lib, based_file FROM raw_dspdbr"
