@@ -307,6 +307,20 @@ def _first_line(exc: Exception) -> str:
     return str(exc).strip().splitlines()[0] if str(exc).strip() else repr(exc)
 
 
+# Per-file failure notes shown on the console before suppressing the rest —
+# hundreds of identical failures flood the terminal, and the host-call log
+# records every one with timestamp and full error anyway.
+_MAX_FAILURE_NOTES = 3
+
+
+def _note_failure(p, failures: int, msg: str) -> None:
+    if failures <= _MAX_FAILURE_NOTES:
+        p.note(msg)
+    elif failures == _MAX_FAILURE_NOTES + 1:
+        p.note("further per-file failures suppressed — the failure count is "
+               "in the final counts and every error is in the host-call log")
+
+
 def harvest_ffd(session: HostSession, con, config,
                 files: "Sequence[tuple[str, str]] | None" = None,
                 scratch_lib: str | None = None,
@@ -386,8 +400,9 @@ def harvest_ffd(session: HostSession, con, config,
                 p.note(f"DSPFFD {lib}/{file} failed ({_first_line(exc)}) — "
                        f"library {lib} marked dead, skipping its other files")
             else:
-                p.note(f"DSPFFD {lib}/{file} failed ({_first_line(exc)}) — "
-                       "skipped")
+                _note_failure(p, failures,
+                              f"DSPFFD {lib}/{file} failed "
+                              f"({_first_line(exc)}) — skipped")
             continue
         rows = [r for r in map_ffd(res)
                 if ((r[0] or "").upper(), (r[1] or "").upper()) == key]
@@ -461,8 +476,9 @@ def harvest_dbr(session: HostSession, con, config,
                 p.note(f"DSPDBR {lib}/{file} failed ({_first_line(exc)}) — "
                        f"library {lib} marked dead, skipping its other files")
             else:
-                p.note(f"DSPDBR {lib}/{file} failed ({_first_line(exc)}) — "
-                       "skipped")
+                _note_failure(p, failures,
+                              f"DSPDBR {lib}/{file} failed "
+                              f"({_first_line(exc)}) — skipped")
             continue
         rows = [r for r in map_dbr(res)
                 if ((r[0] or "").upper(), (r[1] or "").upper()) == key]

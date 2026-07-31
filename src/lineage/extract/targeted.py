@@ -179,6 +179,27 @@ def _catalog_present_pairs(con) -> set[tuple[str, str]]:
     return present
 
 
+def _system_name_map(con) -> dict[tuple[str, str], str]:
+    """(LIB, SQL_NAME) -> 10-char system name, from the pulled catalog.
+
+    CL commands (DSPFFD/DSPDBR) address *objects*, whose names are at most
+    10 characters. Slice entries discovered from parsed SQL carry long SQL
+    names (DIVIDEND_EXCHANGE_RATE_PSEUDO), and feeding those to a CL command
+    fails with CPF0006 "wrong length" — one failed host call per long-named
+    file on a live run. Both catalog views are consulted: a table can have
+    rows in one but not the other depending on which pulls have run.
+    """
+    out: dict[tuple[str, str], str] = {}
+    for src in ("raw_systables", "raw_syscolumns"):
+        for schema, name, sysname in con.execute(
+                f"SELECT DISTINCT table_schema, table_name, system_name "
+                f"FROM {src}").fetchall():
+            if schema and name and sysname:
+                out[(str(schema).upper(), str(name).upper())] = \
+                    str(sysname).upper()
+    return out
+
+
 def _resolve_unqualified(con, config: Config, name: str) -> Optional[str]:
     """Best-effort library resolution for an unqualified (*LIBL) name against
     the catalog already loaded (raw_systables) and the default liblist.
@@ -364,6 +385,11 @@ def harvest_targeted(session: HostSession, con, config: Config,
         for kind, nlib, nname, reason in new_names:
             sl.add(kind, nlib, nname, round_no, reason)
 
+    # Long-SQL-name -> system-name translation for anything that addresses
+    # host *objects* (CL commands, OBJECT_STATISTICS); refreshed after each
+    # round's catalog pull, seeded here so resume runs see the loaded store.
+    sysnames = _system_name_map(con)
+
     for round_no in range(1, MAX_ROUNDS + 1):
         p.phase(f"round {round_no}")
         progs_before = len(sl.of_kind("program"))
@@ -419,18 +445,44 @@ def harvest_targeted(session: HostSession, con, config: Config,
                 p.note(f"{skipped_nondb} slice files have no catalog columns "
                        "(device files, phantom libraries, or deleted "
                        "objects) — DSPFFD/DSPDBR skipped for them")
-            if db_files:
+            # CL commands need the 10-char *system* name; slice entries from
+            # parsed SQL carry long SQL names. Translate via the catalog just
+            # pulled; a name that is too long with no system-name mapping
+            # cannot be addressed by any CL command and is skipped outright.
+            sysnames = _system_name_map(con)
+            dsp_pairs: list[tuple[str, str]] = []
+            dsp_seen: set[tuple[str, str]] = set()
+            unaddressable = 0
+            for lib, name in db_files:
+                key = (lib.upper(), name.upper())
+                sysn = sysnames.get(key, key[1])
+                if len(sysn) > 10:
+                    unaddressable += 1
+                    continue
+                pair = (key[0], sysn)
+                if pair not in dsp_seen:
+                    dsp_seen.add(pair)
+                    dsp_pairs.append(pair)
+            if unaddressable:
+                counts["slice.unaddressable_files_skipped"] = (
+                    counts.get("slice.unaddressable_files_skipped", 0)
+                    + unaddressable)
+                p.note(f"{unaddressable} long-named files have no 10-char "
+                       "system name in the catalog — DSPFFD/DSPDBR skipped")
+            if dsp_pairs:
                 _add_prefixed(counts, "xref", xref.harvest_ffd(
-                    session, con, config, files=db_files, progress=progress))
+                    session, con, config, files=dsp_pairs, progress=progress))
                 dbr_counts = xref.harvest_dbr(session, con, config,
-                                              files=db_files,
+                                              files=dsp_pairs,
                                               progress=progress)
                 _add_prefixed(counts, "xref", dbr_counts)
 
             based_on = con.execute(
                 "SELECT dep_lib, dep_file, based_lib, based_file FROM raw_dspdbr"
             ).fetchall()
-            requested = {(lib.upper(), name.upper()) for lib, name in new_files}
+            # DSPDBR rows carry system names; requests may be long-named.
+            requested = ({(lib.upper(), name.upper())
+                          for lib, name in new_files} | dsp_seen)
             for dlib, dfile, blib, bfile in based_on:
                 if not dfile or not bfile:
                     continue
@@ -475,12 +527,20 @@ def harvest_targeted(session: HostSession, con, config: Config,
                     key = (kind, lib, name)
                     if key in src_locations:
                         continue
+                    # Objects are addressed by 10-char system names; a
+                    # long SQL name resolves through the catalog map, and
+                    # one with no mapping cannot exist as an object.
+                    obj_name = sysnames.get((lib.upper(), name), name)
+                    if len(obj_name) > 10:
+                        src_locations[key] = None
+                        n_probed_this_round += 1
+                        continue
                     if bulk is not None:
                         # Absent from an authoritative scan == no such
                         # object == probed-and-missed.
-                        loc = bulk.get(name)
+                        loc = bulk.get(obj_name)
                     else:
-                        loc = objinfo.source_location(session, lib, name,
+                        loc = objinfo.source_location(session, lib, obj_name,
                                                       obj_type)
                     src_locations[key] = loc
                     n_probed_this_round += 1

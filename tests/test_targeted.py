@@ -1028,3 +1028,92 @@ def test_scoped_systables_pull_inserts_discovered_table():
         "SELECT table_schema, table_name FROM raw_systables").fetchone()
     assert row == ("TNTACCDTA", "BROAST")
     con.close()
+
+
+# --- Long SQL names: CL commands must use 10-char system names -----------------
+
+def test_dsp_commands_use_system_name_for_long_sql_names():
+    """A slice file known by its long SQL name (from parsed DDL) must be
+    DSPFFD/DSPDBR'd by its 10-char system name — the long name fails with
+    CPF0006 'wrong length' (live: DSPDBR TNTIN1DTA/DIVIDEND_EXCHANGE_...)."""
+    from lineage.extract import targeted
+
+    responses = _otherlib_responses()
+    responses["catalog.syscolumns"] = _syscolumns_rows(("TESTLIB", "OUT1"))
+    responses["catalog.syscolumns"] = QueryResult(
+        columns=["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal", "data_type", "length",
+                 "numeric_scale", "is_nullable", "column_heading"],
+        rows=[("TESTLIB", "OUT1", "OUT1", "F", "F", 1,
+               "DECIMAL", 9, 0, "N", "F"),
+              ("TESTLIB", "DIVIDEND_EXCHANGE_RATE_PSEUDO", "DIVEXRP",
+               "F2", "F2", 1, "DECIMAL", 9, 0, "N", "F2")])
+    session = FixtureHostSession(responses=responses)
+    con = dbmod.connect(None)
+    import dataclasses
+
+    from lineage.config import OutputSeed
+    cfg = _synthetic_config()
+    cfg = dataclasses.replace(cfg, output_seeds=tuple(
+        list(cfg.output_seeds)
+        + [OutputSeed(id="LONGT", library="TESTLIB",
+                      file="DIVIDEND_EXCHANGE_RATE_PSEUDO")]))
+    targeted.harvest_targeted(session, con, cfg)
+
+    assert any("DSPFFD FILE(TESTLIB/DIVEXRP)" in c for c in session.cl_log)
+    assert not any("DIVIDEND_EXCHANGE" in c for c in session.cl_log)
+    con.close()
+
+
+def test_long_name_without_system_name_is_skipped_not_attempted():
+    from lineage.extract import targeted
+
+    responses = _otherlib_responses()
+    responses["catalog.syscolumns"] = QueryResult(
+        columns=["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal", "data_type", "length",
+                 "numeric_scale", "is_nullable", "column_heading"],
+        rows=[("TESTLIB", "OUT1", "OUT1", "F", "F", 1,
+               "DECIMAL", 9, 0, "N", "F"),
+              ("TESTLIB", "AN_UNMAPPED_LONG_TABLE_NAME", None,
+               "F2", "F2", 1, "DECIMAL", 9, 0, "N", "F2")])
+    session = FixtureHostSession(responses=responses)
+    con = dbmod.connect(None)
+    import dataclasses
+
+    from lineage.config import OutputSeed
+    cfg = _synthetic_config()
+    cfg = dataclasses.replace(cfg, output_seeds=tuple(
+        list(cfg.output_seeds)
+        + [OutputSeed(id="LONGU", library="TESTLIB",
+                      file="AN_UNMAPPED_LONG_TABLE_NAME")]))
+    counts = targeted.harvest_targeted(session, con, cfg)
+
+    assert not any("AN_UNMAPPED" in c for c in session.cl_log)
+    assert counts["slice.unaddressable_files_skipped"] >= 1
+    con.close()
+
+
+def test_perfile_failure_notes_are_throttled():
+    """Hundreds of identical per-file failures must not flood the console:
+    a few notes, then one suppression line — the host log has the rest."""
+    from lineage.extract import xref
+    from lineage.extract.connection import HostError
+    from lineage.extract.progress import Progress
+
+    class _AllFail(FixtureHostSession):
+        def run_cl(self, command: str) -> None:
+            super().run_cl(command)
+            raise HostError("[CPF0006] Errors occurred in command.")
+
+    session = _AllFail(responses={})
+    con = dbmod.connect(None)
+    out: list[str] = []
+    files = [("LIB1", f"F{i:03d}") for i in range(10)]
+    counts = xref.harvest_dbr(session, con, _synthetic_config(), files=files,
+                              progress=Progress(echo=out.append))
+    assert counts["raw_dspdbr_failures"] == 10
+    failure_notes = [ln for ln in out if "failed" in ln]
+    assert len(failure_notes) == xref._MAX_FAILURE_NOTES
+    assert sum("suppressed" in ln for ln in out) == 1
+    con.close()
