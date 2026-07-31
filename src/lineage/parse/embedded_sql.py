@@ -14,12 +14,21 @@ failures recorded per statement, never fatal").
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Optional
 
 import sqlglot
 from sqlglot import exp
+
+# sqlglot logs one WARNING per statement it downgrades to a bare Command
+# ("... contains unsupported syntax. Falling back to parsing as a 'Command'.");
+# on a real estate of DB2 DDL members that floods the console with thousands
+# of lines. Parse fidelity is recorded per statement here (stmt_type /
+# parse_error / the sql_parse_errors count), so the library's own log noise
+# is switched off.
+logging.getLogger("sqlglot").setLevel(logging.ERROR)
 
 
 def _pick_dialect() -> str | None:
@@ -36,26 +45,50 @@ def _pick_dialect() -> str | None:
 
 DIALECT = _pick_dialect()
 
-# DB2 for i clauses the generic dialect chokes on; all are lineage-neutral.
-_DB2ISM_RES = [
-    re.compile(r"\bWITH\s+(?:UR|CS|RS|RR)\b", re.IGNORECASE),
-    re.compile(r"\bFOR\s+(?:READ|FETCH)\s+ONLY\b", re.IGNORECASE),
-    re.compile(r"\bOPTIMIZE\s+FOR\s+\d+\s+ROWS?\b", re.IGNORECASE),
-    re.compile(r"\bWITH\s+NC\b", re.IGNORECASE),
-    re.compile(r"\bSKIP\s+LOCKED\s+DATA\b", re.IGNORECASE),
+# DB2 for i clauses the generic dialect chokes on, as (pattern, replacement)
+# pairs; all are lineage-neutral. The DDL entries make typical DB2 for i
+# CREATE TABLE members (FOR COLUMN system names, CCSID, WITH DEFAULT,
+# RCDFMT) parse as real Create trees instead of erroring out. Order matters
+# for the two WITH DEFAULT rules: the valueless form is removed first, then
+# the explicit-value form loses its non-standard WITH.
+_NAME = r"(?:\"[^\"]+\"|[A-Za-z_#$@][\w#$@]*)"
+_DB2ISM_RES: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bWITH\s+(?:UR|CS|RS|RR)\b", re.IGNORECASE), " "),
+    (re.compile(r"\bFOR\s+(?:READ|FETCH)\s+ONLY\b", re.IGNORECASE), " "),
+    (re.compile(r"\bOPTIMIZE\s+FOR\s+\d+\s+ROWS?\b", re.IGNORECASE), " "),
+    (re.compile(r"\bWITH\s+NC\b", re.IGNORECASE), " "),
+    (re.compile(r"\bSKIP\s+LOCKED\s+DATA\b", re.IGNORECASE), " "),
+    (re.compile(rf"\bFOR\s+COLUMN\s+{_NAME}", re.IGNORECASE), " "),
+    (re.compile(r"\bCCSID\s+\d+", re.IGNORECASE), " "),
+    (re.compile(r"\bWITH\s+DEFAULT\s*(?=[,)])", re.IGNORECASE), " "),
+    (re.compile(r"\bWITH\s+(DEFAULT\b)", re.IGNORECASE), r"\1"),
+    (re.compile(rf"\bRCDFMT\s+{_NAME}", re.IGNORECASE), " "),
 ]
+
+# System naming: DB2 for i accepts LIB/OBJECT where SQL naming uses
+# LIB.OBJECT, and sqlglot only understands the latter (a slash elsewhere is
+# division, so the rewrite is anchored to the keywords that introduce an
+# object name — never applied to arbitrary expressions).
+_SYSNAME_RE = re.compile(
+    rf"\b(FROM|JOIN|INTO|TABLE|UPDATE|VIEW|INDEX|EXISTS|LIKE)\s+"
+    rf"({_NAME})\s*/\s*(?={_NAME})",
+    re.IGNORECASE)
 
 
 def _strip_db2isms(sql: str) -> str:
-    for rx in _DB2ISM_RES:
-        sql = rx.sub(" ", sql)
+    sql = _SYSNAME_RE.sub(r"\1 \2.", sql)
+    for rx, repl in _DB2ISM_RES:
+        sql = rx.sub(repl, sql)
     return sql
 
-# Statements that carry no lineage but appear in embedded SQL constantly.
+# Statements that carry no lineage but appear in embedded SQL and RUNSQLSTM
+# DDL members constantly (LABEL ON / COMMENT ON / GRANT would otherwise
+# either fail to parse or over-report their target as a *read*).
 _NOISE_RE = re.compile(
     r"^\s*(?:DECLARE\s+\w+\s+CURSOR|OPEN\b|CLOSE\b|FETCH\b|COMMIT\b|"
     r"ROLLBACK\b|WHENEVER\b|SET\s+OPTION\b|INCLUDE\b|BEGIN\s+DECLARE|"
-    r"END\s+DECLARE)",
+    r"END\s+DECLARE|LABEL\s+ON\b|COMMENT\s+ON\b|GRANT\b|REVOKE\b|"
+    r"SET\s+(?:CURRENT\s+)?(?:SCHEMA|PATH)\b)",
     re.IGNORECASE,
 )
 _DYNAMIC_RE = re.compile(r"^\s*(?:PREPARE|EXECUTE\s+IMMEDIATE|EXECUTE)\b",
@@ -146,9 +179,70 @@ def analyze_statement(sql: str) -> SqlAnalysis:
     try:
         tree = sqlglot.parse_one(_strip_db2isms(sql), read=DIALECT)
     except Exception as excinfo:  # noqa: BLE001 - recorded, never fatal
-        return SqlAnalysis(stmt_type="PARSE_ERROR", parse_error=str(excinfo))
+        return _unparsed_fallback(sql, str(excinfo))
+    if isinstance(tree, exp.Command):
+        # sqlglot gave up mid-statement and kept only the leading keyword —
+        # the tree carries no tables at all, so treat it like a parse failure
+        # and salvage what a regex can still see.
+        return _unparsed_fallback(
+            sql, "unsupported syntax (sqlglot fell back to Command)")
 
     return _analyze_tree(tree)
+
+
+_CREATE_FALLBACK_RE = re.compile(
+    rf"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(TABLE|VIEW)\s+"
+    rf"({_NAME}(?:\s*[./]\s*{_NAME})?)",
+    re.IGNORECASE)
+
+
+def _norm_obj_name(raw: str) -> str:
+    parts = re.split(r"\s*[./]\s*", raw.strip())
+    return "/".join(p.strip('"').upper() for p in parts)
+
+
+def _unparsed_fallback(sql: str, error: str) -> SqlAnalysis:
+    """Name-level salvage for DB2 DDL sqlglot cannot fully parse.
+
+    Real estates carry CREATE TABLE members full of DB2-isms the stripper
+    cannot enumerate exhaustively (partitioning clauses, tablespace ``IN``,
+    field procedures, ...). Losing the whole statement would drop the one
+    fact lineage needs most — *which* table the member creates, and for
+    CREATE TABLE AS, from *what*. The result keeps ``parse_error`` set with
+    a non-PARSE_ERROR ``stmt_type``: downstream (graph build) reads that
+    combination as *partially parsed* and emits the table-level edges at
+    inferred confidence instead of discarding them.
+    """
+    a = SqlAnalysis(stmt_type="PARSE_ERROR", parse_error=error)
+    m = _CREATE_FALLBACK_RE.match(sql)
+    if not m:
+        return a
+    a.stmt_type = f"CREATE_{m.group(1).upper()}"
+    tname = _norm_obj_name(m.group(2))
+    a.tables_written = [tname]
+    # CREATE ... AS (SELECT ...) [WITH DATA]: the inner select usually parses
+    # fine on its own even when the outer DDL does not.
+    msel = re.search(r"\bAS\s*\(?\s*(SELECT\b.*)", sql,
+                     re.IGNORECASE | re.DOTALL)
+    if msel:
+        inner_sql = re.sub(r"\s*WITH\s+(?:NO\s+)?DATA\b.*$", "",
+                           msel.group(1), flags=re.IGNORECASE | re.DOTALL)
+        # Trim only the *excess* closing parens left over from the AS (...)
+        # wrapper — a select legitimately ending in ')' must keep its own.
+        inner_sql = inner_sql.rstrip()
+        while (inner_sql.endswith(")")
+               and inner_sql.count("(") < inner_sql.count(")")):
+            inner_sql = inner_sql[:-1].rstrip()
+        inner = analyze_statement(inner_sql)
+        if not inner.parse_error and inner.stmt_type == "SELECT":
+            a.tables_read = [t for t in inner.tables_read if t != tname]
+            for item in inner.column_lineage:
+                a.column_lineage.append({
+                    "target": f"{tname}.{item['target']}",
+                    "sources": item["sources"],
+                })
+            a.columns_used = inner.columns_used
+    return a
 
 
 def _analyze_tree(tree: exp.Expression) -> SqlAnalysis:

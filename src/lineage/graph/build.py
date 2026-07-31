@@ -587,27 +587,38 @@ class GraphBuilder:
             plib, pname = self._split_qualified(base_program)
             pid = self.add_program_node(plib, pname)
 
-            if perr:
+            # parse_error with stmt_type PARSE_ERROR = nothing salvaged;
+            # parse_error with a real stmt_type = the name-level DDL fallback
+            # in parse/embedded_sql.py — its table facts are regex-derived,
+            # so they flow through at INFERRED confidence, gap still logged.
+            partial = bool(perr) and stmt_type != "PARSE_ERROR"
+            if perr and not partial:
                 self.gap("parse_error", f"program:{base_program}",
                          f"SQL statement failed to parse: {perr[:200]}",
                          {"sql": (raw_sql or "")[:500]})
                 continue
+            if partial:
+                self.gap("parse_error", f"program:{base_program}",
+                         "SQL statement partially parsed (name-level DDL "
+                         f"fallback): {perr[:200]}",
+                         {"sql": (raw_sql or "")[:500]})
             if stmt_type == "DYNAMIC":
                 self.gap("unresolved_dynamic_name", f"program:{base_program}",
                          "dynamic SQL (PREPARE/EXECUTE IMMEDIATE)",
                          {"sql": (raw_sql or "")[:500]})
                 continue
 
+            conf = Confidence.INFERRED if partial else Confidence.PARSED
             for tname in json.loads(tr_json or "[]"):
                 fid = self._sql_table_node(tname, base_program)
                 self.add_edge(Edge(src=pid, dst=fid, kind=EdgeKind.READS,
                                    provenance=Provenance.SOURCE_SQL,
-                                   confidence=Confidence.PARSED))
+                                   confidence=conf))
             for tname in json.loads(tw_json or "[]"):
                 fid = self._sql_table_node(tname, base_program)
                 self.add_edge(Edge(src=pid, dst=fid, kind=EdgeKind.WRITES,
                                    provenance=Provenance.SOURCE_SQL,
-                                   confidence=Confidence.PARSED))
+                                   confidence=conf))
 
             for item in json.loads(cl_json or "[]"):
                 tgt = item.get("target", "")
@@ -623,7 +634,7 @@ class GraphBuilder:
                     self.add_edge(Edge(src=tgt_id, dst=src_id,
                                        kind=EdgeKind.DERIVES_FROM,
                                        provenance=Provenance.SOURCE_SQL,
-                                       confidence=Confidence.PARSED,
+                                       confidence=conf,
                                        context={"program": base_program}))
 
     def _sql_table_node(self, tname: str, program: str) -> str:
@@ -709,12 +720,17 @@ class GraphBuilder:
             "SELECT program, stmt_type, tables_read, columns_used, parse_error "
             "FROM parsed_sql_statements").fetchall()
         for program, stmt_type, tr_json, cu_json, perr in rows:
-            if perr or stmt_type == "DYNAMIC":
+            # Partial DDL-fallback statements (parse_error set, real
+            # stmt_type) keep their columns_used: those come from a fully
+            # parsed inner SELECT, only the outer DDL shell failed.
+            partial = bool(perr) and stmt_type != "PARSE_ERROR"
+            if (perr and not partial) or stmt_type == "DYNAMIC":
                 continue
             base_program = program.split("#")[0]
             plib, pname = self._split_qualified(base_program)
             pid = self.add_program_node(plib, pname)
             read_tables = set(json.loads(tr_json or "[]"))
+            conf = Confidence.INFERRED if partial else Confidence.PARSED
             for ref in json.loads(cu_json or "[]"):
                 if "." not in ref:
                     continue
@@ -728,7 +744,7 @@ class GraphBuilder:
                     continue
                 self.add_edge(Edge(src=pid, dst=col_id, kind=EdgeKind.READS,
                                    provenance=Provenance.SOURCE_SQL,
-                                   confidence=Confidence.PARSED,
+                                   confidence=conf,
                                    context={"mechanism": "sql_reference"}))
 
     def _cpyf_column_usage_edges(self) -> None:

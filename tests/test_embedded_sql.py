@@ -156,3 +156,123 @@ def test_parse_all_fixture_estate(parsed):
     assert stype == "INSERT"
     assert json.loads(tr) == ["ORDERS"]
     assert json.loads(tw) == ["ORDEXT"]
+
+
+# --- DB2 for i DDL: system naming, column clauses, and the salvage fallback ---
+
+def test_system_naming_slash_create_table():
+    """LIB/FILE system naming was sqlglot's biggest live failure — every DDL
+    member using it fell back to a bare Command ('contains unsupported
+    syntax') and lost its table entirely."""
+    a = analyze_statement("CREATE TABLE MYLIB/CUSTRPT (A CHAR(10) NOT NULL)")
+    assert a.stmt_type == "CREATE_TABLE"
+    assert a.tables_written == ["MYLIB/CUSTRPT"]
+    assert a.parse_error is None
+
+
+def test_system_naming_slash_dml():
+    a = analyze_statement(
+        "INSERT INTO MYLIB/ORDEXT SELECT ORDNO FROM MYLIB/ORDERS")
+    assert a.tables_written == ["MYLIB/ORDEXT"]
+    assert a.tables_read == ["MYLIB/ORDERS"]
+    assert a.parse_error is None
+
+
+def test_division_is_not_mistaken_for_system_naming():
+    a = analyze_statement("SELECT AMOUNT / QTY FROM ORDERS")
+    assert a.stmt_type == "SELECT"
+    assert a.tables_read == ["ORDERS"]
+    assert set(a.columns_used) == {"ORDERS.AMOUNT", "ORDERS.QTY"}
+
+
+def test_db2_ddl_column_clauses_parse_cleanly():
+    a = analyze_statement(
+        "CREATE TABLE MYLIB.CUSTRPT (\n"
+        "  CUSTNAME FOR COLUMN CUSTNM CHAR(30) CCSID 37 NOT NULL WITH DEFAULT,\n"
+        "  AMT DECIMAL(11,2) NOT NULL WITH DEFAULT 0\n"
+        ") RCDFMT CUSTRPTR")
+    assert a.stmt_type == "CREATE_TABLE"
+    assert a.tables_written == ["MYLIB/CUSTRPT"]
+    assert a.parse_error is None
+
+
+def test_ctas_system_naming_with_data():
+    a = analyze_statement(
+        "CREATE TABLE MYLIB/SUMTAB AS (SELECT ORDNO, SUM(AMOUNT) AS TOT "
+        "FROM MYLIB/ORDERS GROUP BY ORDNO) WITH DATA")
+    assert a.stmt_type == "CREATE_TABLE"
+    assert a.tables_written == ["MYLIB/SUMTAB"]
+    assert a.tables_read == ["MYLIB/ORDERS"]
+    assert a.parse_error is None
+
+
+def test_unparseable_ddl_salvages_created_table():
+    """DB2-isms the stripper doesn't know (tablespace IN clause here) must
+    not lose the created table: name-level fallback, parse_error kept."""
+    a = analyze_statement("CREATE TABLE MYLIB.T1 (A INT) IN MYLIB.TS1")
+    assert a.stmt_type == "CREATE_TABLE"
+    assert a.tables_written == ["MYLIB/T1"]
+    assert a.parse_error
+
+
+def test_unparseable_ctas_salvages_inner_select():
+    a = analyze_statement(
+        "CREATE TABLE MYLIB.SUM2 AS (SELECT A FROM MYLIB.ORD2) "
+        "WITH DATA IN MYLIB.TS1")
+    assert a.stmt_type == "CREATE_TABLE"
+    assert a.tables_written == ["MYLIB/SUM2"]
+    assert a.tables_read == ["MYLIB/ORD2"]
+    assert a.parse_error   # honest: the outer DDL never fully parsed
+
+
+def test_ddl_noise_statements_skipped():
+    for sql in ("LABEL ON TABLE MYLIB.CUSTRPT IS 'Customer report'",
+                "LABEL ON COLUMN MYLIB.CUSTRPT (CUSTNAME IS 'Name')",
+                "COMMENT ON TABLE MYLIB.CUSTRPT IS 'X'",
+                "GRANT SELECT ON MYLIB.T1 TO PUBLIC",
+                "REVOKE ALL ON MYLIB.T1 FROM PUBLIC",
+                "SET PATH = MYLIB",
+                "SET CURRENT SCHEMA = MYLIB"):
+        assert analyze_statement(sql).stmt_type == "NOISE", sql
+
+
+def test_sqlglot_command_warning_is_silenced():
+    import logging
+    assert logging.getLogger("sqlglot").getEffectiveLevel() >= logging.ERROR
+
+
+def test_partial_ddl_reaches_graph_at_inferred_confidence():
+    """A partially parsed CREATE TABLE (parse_error set, real stmt_type) must
+    still put its WRITES edge in the graph — at inferred confidence — with a
+    gap recorded, instead of being discarded."""
+    import json as jsonmod
+
+    from lineage import db as dbmod
+    from lineage.config import from_dict
+    from lineage.graph.build import build_graph
+    from lineage.parse.embedded_sql import analyze_statement as _an
+
+    con = dbmod.connect(None)
+    a = _an("CREATE TABLE TESTLIB.WEIRD (A INT) IN TESTLIB.TS1")
+    con.execute(
+        "INSERT INTO parsed_sql_statements (program, seq, stmt_type, ast_json,"
+        " tables_read, tables_written, column_lineage, columns_used,"
+        " parse_error, raw_sql) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ["TESTLIB/DDLPGM", 1, a.stmt_type, None,
+         jsonmod.dumps(a.tables_read), jsonmod.dumps(a.tables_written),
+         jsonmod.dumps(a.column_lineage), jsonmod.dumps(a.columns_used),
+         a.parse_error, "CREATE TABLE ..."])
+    config = from_dict({
+        "scratch_lib": "QTEMP", "libraries": ["TESTLIB"],
+        "output_seeds": [{"id": "X", "library": "TESTLIB", "file": "WEIRD"}],
+        "liblists": {"default": ["TESTLIB"]},
+    })
+    g = build_graph(con, config, phase=3)
+    edges = [(u, v, d) for u, v, d in g.edges(data=True)
+             if d.get("kind") == "writes"]
+    assert any(v == "file:TESTLIB/WEIRD" and d.get("confidence") == "inferred"
+               for _u, v, d in edges)
+    gaps = con.execute(
+        "SELECT detail FROM gaps WHERE kind = 'parse_error'").fetchall()
+    assert any("partially parsed" in (d or "") for (d,) in gaps)
+    con.close()
