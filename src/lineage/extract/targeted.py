@@ -652,7 +652,7 @@ def _discover_names(library: str, srcfile: str, member: str,
         for blk in prog.sql_blocks:
             out.extend(_sql_table_names(blk, con, config))
 
-    elif member_type and member_type.upper() in {"SQL"}:
+    elif m.is_sql():
         from ..parse.embedded_sql import split_sql_script
         for stmt in split_sql_script(m.text):
             out.extend(_sql_table_names(stmt, con, config))

@@ -276,3 +276,120 @@ def test_partial_ddl_reaches_graph_at_inferred_confidence():
         "SELECT detail FROM gaps WHERE kind = 'parse_error'").fetchall()
     assert any("partially parsed" in (d or "") for (d,) in gaps)
     con.close()
+
+
+# --- Standalone SQL script members (SQLTABL et al.) ----------------------------
+
+def test_sql_member_type_detection():
+    """SQLTABL-style stamps are standalone SQL; embedded-SQL host languages
+    are not (their SQL arrives via the language parser's blocks)."""
+    from lineage.parse.base import SourceMember
+
+    def m(mtype):
+        return SourceMember(library="L", srcfile="S", member="M",
+                            member_type=mtype, lines=[])
+
+    for yes in ("SQL", "SQLTABL", "SQLVIEW", "SQLPRC", "SQLIDX", "TABLE",
+                "VIEW", "sqltabl", "SQLSEQ", "SQLXYZ"):
+        assert m(yes).is_sql(), yes
+    for no in ("SQLRPGLE", "SQLRPG", "SQLCBLLE", "CLP", "RPGLE", "PF", "LF",
+               "TXT", "", None):
+        assert not m(no).is_sql(), no
+
+
+def test_parse_all_ingests_standalone_sql_members():
+    """A SQLTABL member in raw_source_members must land in
+    parsed_sql_statements with a program key tracing back to the member —
+    the live BROAST bug was exactly this pass not existing."""
+    from lineage import db as dbmod
+    from lineage.db import insert_rows
+    from lineage.parse import embedded_sql
+
+    con = dbmod.connect(None)
+    ddl = [
+        "CREATE TABLE TNTACCDTA.BROAST (CACINM DECIMAL(9,2), CASSET CHAR(10))",
+        "LABEL ON TABLE TNTACCDTA.BROAST IS 'Broker assets'",
+        ("INSERT INTO TNTACCDTA.BROAST (CACINM, CASSET) "
+         "SELECT ACINM, ASSET FROM TNTACCDTA.BARGAIN"),
+    ]
+    text = ";\n".join(ddl) + ";"
+    insert_rows(con, "raw_source_members",
+                ["library", "srcfile", "member", "member_type", "seq",
+                 "line_text"],
+                [("TNTACCSRC", "QDDLSRC", "BROAST", "SQLTABL", i + 1, ln)
+                 for i, ln in enumerate(text.splitlines())])
+    counts = embedded_sql.parse_all(con)
+    assert counts["sql_statements"] >= 2   # CREATE + INSERT (LABEL is noise)
+
+    rows = con.execute(
+        "SELECT program, stmt_type, tables_written FROM parsed_sql_statements"
+    ).fetchall()
+    assert all(p == "TNTACCSRC/BROAST#SQLMBR:QDDLSRC" for p, _, _ in rows)
+    types = {t for _, t, _ in rows}
+    assert "CREATE_TABLE" in types and "INSERT" in types
+    assert all("TNTACCDTA/BROAST" in tw for _, t, tw in rows
+               if t in ("CREATE_TABLE", "INSERT"))
+    con.close()
+
+
+def test_runsqlstm_member_not_double_parsed():
+    """A member reached via RUNSQLSTM keeps its CL-attributed rows only —
+    the standalone pass must not duplicate it."""
+    import json as jsonmod
+
+    from lineage import db as dbmod
+    from lineage.db import insert_rows
+    from lineage.parse import embedded_sql
+
+    con = dbmod.connect(None)
+    insert_rows(con, "raw_source_members",
+                ["library", "srcfile", "member", "member_type", "seq",
+                 "line_text"],
+                [("APPLIB", "QSQLSRC", "MKTBL", "SQLTABL", 1,
+                  "CREATE TABLE APPLIB.T9 (A INT)")])
+    insert_rows(con, "parsed_cl_calls",
+                ["program", "seq", "called_lib", "called_pgm", "via",
+                 "params", "resolved"],
+                [("APPLIB/DRIVER", 1, None, None, "RUNSQLSTM",
+                  jsonmod.dumps([jsonmod.dumps({"srcmbr": "MKTBL"})]), True)])
+    embedded_sql.parse_all(con)
+    rows = con.execute(
+        "SELECT program FROM parsed_sql_statements").fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "APPLIB/DRIVER#RUNSQLSTM:MKTBL"
+    con.close()
+
+
+def test_standalone_sql_member_produces_column_derives_edges():
+    """End to end (parse -> phase-3 build): a BROAST-like standalone member
+    whose INSERT...SELECT feeds the DDL table must yield derives_from edges
+    from the output's columns to the source table's columns."""
+    from lineage import db as dbmod
+    from lineage.config import from_dict
+    from lineage.db import insert_rows
+    from lineage.graph.build import build_graph
+    from lineage.parse import embedded_sql
+
+    con = dbmod.connect(None)
+    text = ("CREATE TABLE TNTACCDTA.BROAST (CACINM DECIMAL(9,2));\n"
+            "INSERT INTO TNTACCDTA.BROAST (CACINM) "
+            "SELECT ACINM FROM TNTACCDTA.BARGAIN;")
+    insert_rows(con, "raw_source_members",
+                ["library", "srcfile", "member", "member_type", "seq",
+                 "line_text"],
+                [("TNTACCSRC", "QDDLSRC", "BROAST", "SQLTABL", i + 1, ln)
+                 for i, ln in enumerate(text.splitlines())])
+    embedded_sql.parse_all(con)
+    config = from_dict({
+        "scratch_lib": "QTEMP", "libraries": ["TNTACCDTA"],
+        "output_seeds": [{"id": "B", "library": "TNTACCDTA",
+                          "file": "BROAST"}],
+        "liblists": {"default": ["TNTACCDTA"]},
+    })
+    g = build_graph(con, config, phase=3)
+    derives = [(u, v) for u, v, d in g.edges(data=True)
+               if d.get("kind") == "derives_from"
+               and u.startswith("column:TNTACCDTA/BROAST.")]
+    assert ("column:TNTACCDTA/BROAST.CACINM",
+            "column:TNTACCDTA/BARGAIN.ACINM") in derives
+    con.close()

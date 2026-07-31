@@ -479,7 +479,9 @@ def parse_all(con) -> dict[str, int]:
                      a.parse_error, raw_sql))
 
     # 2. RUNSQLSTM source members referenced from CL.
-    members = {m.member.upper(): m for m in load_members(con)}
+    all_members = load_members(con)
+    members = {m.member.upper(): m for m in all_members}
+    consumed: set[tuple[str, str, str]] = set()
     runsql = con.execute(
         "SELECT program, seq, params FROM parsed_cl_calls WHERE via = 'RUNSQLSTM'"
     ).fetchall()
@@ -492,6 +494,8 @@ def parse_all(con) -> dict[str, int]:
         target = members.get(mbr)
         if target is None:
             continue
+        consumed.add((target.library.upper(), target.srcfile.upper(),
+                      target.member.upper()))
         for j, stmt in enumerate(split_sql_script(target.text)):
             a = analyze_statement(stmt)
             if a.stmt_type in {"EMPTY", "NOISE"}:
@@ -499,6 +503,32 @@ def parse_all(con) -> dict[str, int]:
             if a.parse_error:
                 n_err += 1
             rows.append((f"{cl_program}#RUNSQLSTM:{mbr}", seq * 1000 + j,
+                         a.stmt_type, a.ast_json,
+                         json.dumps(a.tables_read), json.dumps(a.tables_written),
+                         json.dumps(a.column_lineage), json.dumps(a.columns_used),
+                         a.parse_error, stmt))
+
+    # 3. Standalone SQL script members (SQLTABL/SQLVIEW/... — see
+    # base.SQL_TYPES). On estates that manage DDL as source these members
+    # *are* the definitions of the output tables, and until now they were
+    # never parsed: a DDL-defined output whose 148-line CREATE TABLE member
+    # sat in raw_source_members produced zero parsed_sql_statements rows and
+    # therefore zero column derives_from edges (live BROAST symptom). The
+    # program key keeps full traceability to the member origin
+    # (LIB/MEMBER#SQLMBR:SRCFILE); members already consumed via a RUNSQLSTM
+    # reference are not parsed twice.
+    for m in all_members:
+        if not m.is_sql():
+            continue
+        if (m.library.upper(), m.srcfile.upper(), m.member.upper()) in consumed:
+            continue
+        for j, stmt in enumerate(split_sql_script(m.text)):
+            a = analyze_statement(stmt)
+            if a.stmt_type in {"EMPTY", "NOISE"}:
+                continue
+            if a.parse_error:
+                n_err += 1
+            rows.append((f"{m.library}/{m.member}#SQLMBR:{m.srcfile}", j,
                          a.stmt_type, a.ast_json,
                          json.dumps(a.tables_read), json.dumps(a.tables_written),
                          json.dumps(a.column_lineage), json.dumps(a.columns_used),

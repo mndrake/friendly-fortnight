@@ -8,7 +8,16 @@ from dataclasses import dataclass, field
 CL_TYPES = {"CLP", "CLLE", "CL"}
 RPG_TYPES = {"RPGLE", "SQLRPGLE", "RPG", "RPG38", "RPT", "SQLRPG"}
 DDS_TYPES = {"PF", "LF", "PF38", "LF38"}
-SQL_TYPES = {"SQL", "TABLE", "VIEW"}
+# Standalone SQL script members (DDL/DML source, e.g. a CREATE TABLE member
+# in QDDLSRC). Estates that manage DDL as source stamp object-specific
+# member types (SQLTABL, SQLVIEW, ... — RTVSQLSRC and change-management
+# tools both do this); the catch-all prefix rule in
+# :meth:`SourceMember.is_sql` covers stamps not enumerated here, while
+# embedded-SQL *host language* types (SQLRPG*, SQLCBL*) stay with their
+# language parser.
+SQL_TYPES = {"SQL", "TABLE", "VIEW", "SQLTABL", "SQLVIEW", "SQLIDX",
+             "SQLPRC", "SQLFNC", "SQLTRG", "SQLSEQ", "SQLALIAS", "SQLUDT",
+             "SQLUDF"}
 
 
 @dataclass
@@ -40,6 +49,22 @@ class SourceMember:
 
     def is_dds(self) -> bool:
         return self.type_upper in DDS_TYPES
+
+    def is_sql(self) -> bool:
+        """Standalone SQL script member (DDL/DML text, no host language).
+
+        The canonical test for "should the SQL parser consume this member
+        whole": either an enumerated SQL member type, or any ``SQL``-prefixed
+        stamp that is not an embedded-SQL host language (SQLRPGLE is RPG,
+        SQLCBLLE is COBOL — their SQL arrives via the language parser's
+        embedded blocks instead).
+        """
+        t = self.type_upper
+        if t in RPG_TYPES or t in CL_TYPES or t in DDS_TYPES:
+            return False
+        if t in SQL_TYPES:
+            return True
+        return t.startswith("SQL") and "RPG" not in t and "CBL" not in t
 
     def has_embedded_sql(self) -> bool:
         return self.type_upper in {"SQLRPGLE", "SQLRPG"}
