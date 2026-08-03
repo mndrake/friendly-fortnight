@@ -190,39 +190,61 @@ def _column_derives_edges(graph: nx.MultiDiGraph, node: str
     return out
 
 
-def trace_column(graph: nx.MultiDiGraph, root: str,
-                 max_depth: int = _MAX_DEPTH) -> TraceNode:
-    """Build the upstream ``derives_from`` tree for one column node."""
+#: Hard bounds for one column's tree. The derives graph on a real estate is
+#: a dense mesh (same-named fields recur across hundreds of files), so the
+#: walk must be linear in *nodes*, never in paths: each node is expanded at
+#: most once per tree (revisits become truncated stubs), the whole tree is
+#: capped, and a node's fan-in is capped with an explicit "+N more" stub.
+_MAX_NODES = 4000
+_MAX_CHILDREN = 40
 
-    def build(node: str, edge: Optional[dict], visited: frozenset[str],
-              depth: int) -> TraceNode:
+
+def trace_column(graph: nx.MultiDiGraph, root: str,
+                 max_depth: int = _MAX_DEPTH,
+                 max_nodes: int = _MAX_NODES) -> TraceNode:
+    """Build the upstream ``derives_from`` tree for one column node.
+
+    Complexity is O(reachable nodes + edges): a per-path visited set made
+    the walk exponential on dense graphs (a live trace ran for minutes on
+    what should be a sub-second query).
+    """
+    expanded: set[str] = set()
+    count = [0]
+
+    def build(node: str, edge: Optional[dict], depth: int) -> TraceNode:
         tn = TraceNode(
             node=node,
             provenance=(edge or {}).get("provenance"),
             confidence=(edge or {}).get("confidence"),
             context=dict((edge or {}).get("context") or {}),
         )
-        if depth >= max_depth:
+        count[0] += 1
+        if depth >= max_depth or count[0] >= max_nodes:
             tn.truncated = True
             return tn
+        if node in expanded:
+            # Already expanded elsewhere in this tree (shared upstream or a
+            # cycle) — show the reference, don't re-walk it.
+            tn.truncated = True
+            return tn
+        expanded.add(node)
         edges = _column_derives_edges(graph, node)
         if not edges:
             tn.is_base = True
             return tn
-        for dst, data in sorted(
-                edges, key=lambda e: (e[0], e[1].get("provenance", ""),
-                                      e[1].get("confidence", ""))):
-            if dst in visited:
-                tn.children.append(TraceNode(
-                    node=dst, provenance=data.get("provenance"),
-                    confidence=data.get("confidence"),
-                    context=dict(data.get("context") or {}), truncated=True))
-                continue
-            tn.children.append(
-                build(dst, data, visited | {dst}, depth + 1))
+        shown = sorted(
+            edges, key=lambda e: (e[0], e[1].get("provenance", ""),
+                                  e[1].get("confidence", "")))
+        for dst, data in shown[:_MAX_CHILDREN]:
+            tn.children.append(build(dst, data, depth + 1))
+        if len(shown) > _MAX_CHILDREN:
+            tn.children.append(TraceNode(
+                node=f"(+{len(shown) - _MAX_CHILDREN} more upstream edges)",
+                truncated=True))
         return tn
 
-    return build(root, None, frozenset({root}), 0)
+    tn = build(root, None, 0)
+    return tn
 
 
 def _collect_bases(tn: TraceNode, path_conf: Confidence,
@@ -233,6 +255,8 @@ def _collect_bases(tn: TraceNode, path_conf: Confidence,
     if not tn.children:
         if is_root:
             return {}  # the target column itself has no upstream
+        if tn.truncated:
+            return {}  # a stub (revisit/cap), not a base column
         return {tn.node: path_conf}
     out: dict[str, Confidence] = {}
     for child in tn.children:

@@ -185,3 +185,47 @@ def test_diagnose_table_absent_everything():
     assert "(none — the graph has no file node for this table)" in out
     assert "(not in slice_objects)" in out
     con.close()
+
+
+def test_trace_column_linear_on_dense_diamond_mesh():
+    """20 layers of 6 nodes, each deriving from every node of the next layer:
+    ~6^20 paths but only 121 nodes. The walk must finish instantly (node-
+    linear), mark revisits as truncated stubs, and collect each base once."""
+    import time
+
+    import networkx as nx
+
+    from lineage.analyze.column_trace import _collect_bases, trace_column
+    from lineage.graph.model import Confidence
+
+    g = nx.MultiDiGraph()
+    layers = [[f"column:L/T{d}.F{i}" for i in range(6)] for d in range(21)]
+    for d in range(20):
+        for u in layers[d]:
+            for v in layers[d + 1]:
+                g.add_edge(u, v, kind="derives_from", provenance="dds",
+                           confidence="parsed", context={})
+    t0 = time.monotonic()
+    tree = trace_column(g, layers[0][0])
+    elapsed = time.monotonic() - t0
+    assert elapsed < 2.0                      # was effectively unbounded
+    bases = _collect_bases(tree, Confidence.CONFIRMED)
+    # Bases are the last layer's nodes, each exactly once, no stub names.
+    assert set(bases) <= set(layers[20])
+    assert all(not b.startswith("(+") for b in bases)
+
+
+def test_trace_column_caps_fan_in_with_stub():
+    import networkx as nx
+
+    from lineage.analyze.column_trace import _MAX_CHILDREN, trace_column
+
+    g = nx.MultiDiGraph()
+    root = "column:L/T.ROOT"
+    for i in range(_MAX_CHILDREN + 15):
+        g.add_edge(root, f"column:L/S.F{i:03d}", kind="derives_from",
+                   provenance="dds", confidence="parsed", context={})
+    tree = trace_column(g, root)
+    assert len(tree.children) == _MAX_CHILDREN + 1
+    assert tree.children[-1].node == "(+15 more upstream edges)"
+    assert tree.children[-1].truncated
