@@ -179,6 +179,21 @@ def _catalog_present_pairs(con) -> set[tuple[str, str]]:
     return present
 
 
+def _table_types(con) -> dict[tuple[str, str], str]:
+    """(LIB, NAME) -> SYSTABLES TABLE_TYPE, keyed under both name forms."""
+    out: dict[tuple[str, str], str] = {}
+    for schema, name, sysname, ttype in con.execute(
+            "SELECT table_schema, table_name, system_name, table_type "
+            "FROM raw_systables").fetchall():
+        if not schema or ttype is None:
+            continue
+        lib = str(schema).strip().upper()
+        t = str(ttype).strip().upper()
+        for label in {name, sysname} - {None}:
+            out[(lib, str(label).strip().upper())] = t
+    return out
+
+
 def _system_name_map(con) -> dict[tuple[str, str], str]:
     """(LIB, SQL_NAME) -> 10-char system name, from the pulled catalog.
 
@@ -469,11 +484,32 @@ def harvest_targeted(session: HostSession, con, config: Config,
                     + unaddressable)
                 p.note(f"{unaddressable} long-named files have no 10-char "
                        "system name in the catalog — DSPFFD/DSPDBR skipped")
-            if dsp_pairs:
+            # Per-file DSP commands cost ~1s of host time each; most are
+            # structurally redundant. DSPFFD only supplies field names, and
+            # the catalog already has them for every presence-gated pair —
+            # the graph build synthesizes record fields from SYSCOLUMNS
+            # (see GraphBuilder._dspffd_fields), so DSPFFD runs only for
+            # files the catalog somehow doesn't cover. DSPDBR's output only
+            # survives the row filter when the requested file is itself the
+            # *dependent* — logicals/views/unknown types; a physical
+            # table's outfile lists its dependents and is filtered to
+            # nothing, so physicals are skipped outright. On a live estate
+            # this collapsed thousands of ~1s calls per round.
+            ttypes = _table_types(con)
+            ffd_pairs = [pr for pr in dsp_pairs if pr not in present]
+            dbr_pairs = [pr for pr in dsp_pairs
+                         if ttypes.get(pr) not in ("T", "P")]
+            skipped_dsp = (len(dsp_pairs) - len(ffd_pairs)
+                           + len(dsp_pairs) - len(dbr_pairs))
+            if skipped_dsp:
+                counts["slice.dsp_commands_avoided"] = (
+                    counts.get("slice.dsp_commands_avoided", 0) + skipped_dsp)
+            if ffd_pairs:
                 _add_prefixed(counts, "xref", xref.harvest_ffd(
-                    session, con, config, files=dsp_pairs, progress=progress))
+                    session, con, config, files=ffd_pairs, progress=progress))
+            if dbr_pairs:
                 dbr_counts = xref.harvest_dbr(session, con, config,
-                                              files=dsp_pairs,
+                                              files=dbr_pairs,
                                               progress=progress)
                 _add_prefixed(counts, "xref", dbr_counts)
 

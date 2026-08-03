@@ -79,8 +79,12 @@ def test_targeted_retrieves_no_pgmdesc_source(targeted_extracted):
 
 def test_targeted_issues_per_file_dsp_commands(targeted_extracted, session):
     cl_log = session.cl_log
-    assert any("DSPFFD FILE(APPLIB/ORDERS)" in c for c in cl_log)
-    assert any("DSPDBR FILE(APPLIB/ORDERS)" in c for c in cl_log)
+    # Catalog-covered files need no DSPFFD (fields come from SYSCOLUMNS via
+    # the graph build), and DSPDBR only runs for dependents — the logical
+    # file here — never for physical tables.
+    assert not any(c.startswith("DSPFFD") for c in cl_log)
+    assert any("DSPDBR FILE(APPLIB/CUSTLF1)" in c for c in cl_log)
+    assert not any("DSPDBR FILE(APPLIB/ORDERS)" in c for c in cl_log)
     # Never a whole-library *ALL DSPFFD/DSPDBR in targeted mode.
     assert not any("DSPFFD FILE(APPLIB/*ALL)" in c for c in cl_log)
     assert not any("DSPDBR FILE(APPLIB/*ALL)" in c for c in cl_log)
@@ -283,7 +287,9 @@ def test_targeted_slice_discovery_pulls_otherlib_per_file():
     con = dbmod.connect(None)
     counts = targeted.harvest_targeted(session, con, _synthetic_config())
 
-    assert any("DSPFFD FILE(OTHERLIB/EXTFILE)" in c for c in session.cl_log)
+    # EXTFILE is catalog-covered (no DSPFFD needed) and its type is unknown
+    # (no SYSTABLES row), so DSPDBR still probes it per-file.
+    assert not any("DSPFFD FILE(OTHERLIB" in c for c in session.cl_log)
     assert any("DSPDBR FILE(OTHERLIB/EXTFILE)" in c for c in session.cl_log)
     assert not any("OTHERLIB/*ALL" in c for c in session.cl_log)
     assert not any(c.startswith("DSPPGMREF") and "OTHERLIB" in c
@@ -732,7 +738,8 @@ def test_targeted_survives_phantom_discovered_library():
     con = dbmod.connect(None)
     counts = targeted.harvest_targeted(session, con, _synthetic_config())
 
-    assert counts.get("xref.raw_dspffd_failures", 0) >= 1
+    # DSPFFD is no longer issued for catalog-covered files; the DSPDBR
+    # attempt (unknown table type) still exercises the CPF3064 tolerance.
     assert counts.get("xref.raw_dspdbr_failures", 0) >= 1
     sl = _slice_rows(con)
     assert ("file", "OTHERLIB", "EXTFILE") in sl   # audited despite failure
@@ -1060,7 +1067,9 @@ def test_dsp_commands_use_system_name_for_long_sql_names():
                       file="DIVIDEND_EXCHANGE_RATE_PSEUDO")]))
     targeted.harvest_targeted(session, con, cfg)
 
-    assert any("DSPFFD FILE(TESTLIB/DIVEXRP)" in c for c in session.cl_log)
+    # Catalog-covered -> no DSPFFD; unknown table type -> DSPDBR runs, and
+    # it must address the 10-char system name.
+    assert any("DSPDBR FILE(TESTLIB/DIVEXRP)" in c for c in session.cl_log)
     assert not any("DIVIDEND_EXCHANGE" in c for c in session.cl_log)
     con.close()
 

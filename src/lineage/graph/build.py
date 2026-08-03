@@ -666,8 +666,15 @@ class GraphBuilder:
     # -- column usage (program -reads-> column) -------------------------------
 
     def _dspffd_fields(self) -> dict[tuple[str, str], set[str]]:
-        """(LIB, FILE) -> set of field names, from raw_dspffd. Cached — used
-        by both the record-format expansion and the column-usage passes.
+        """(LIB, FILE) -> set of field names. Cached — used by both the
+        record-format expansion and the column-usage passes.
+
+        Sources, unioned: raw_dspffd (DSPFFD outfiles), and raw_syscolumns —
+        the SQL catalog knows every database file's fields under the same
+        10-char internal names DSPFFD reports (SYSTEM_COLUMN_NAME), so a
+        catalog-covered file needs no per-file DSPFFD host call at all.
+        Targeted extraction relies on this to skip those commands; the union
+        keeps full and targeted builds identical.
         """
         if self._ffd_cache is None:
             ffd: dict[tuple[str, str], set[str]] = defaultdict(set)
@@ -676,6 +683,16 @@ class GraphBuilder:
             ).fetchall():
                 if lib and fname and field_name:
                     ffd[(lib.upper(), fname.upper())].add(field_name.upper())
+            for schema, name, sysname, col, syscol in self.con.execute(
+                    "SELECT table_schema, table_name, system_name, "
+                    "column_name, system_column FROM raw_syscolumns"
+            ).fetchall():
+                field = str(syscol or col or "").strip().upper()
+                lib_u = (schema or "").strip().upper()
+                if not field or not lib_u:
+                    continue
+                for label in {name, sysname} - {None}:
+                    ffd[(lib_u, str(label).strip().upper())].add(field)
             self._ffd_cache = ffd
         return self._ffd_cache
 
