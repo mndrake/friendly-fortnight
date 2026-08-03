@@ -850,17 +850,34 @@ class GraphBuilder:
     # -- record-format column expansion --------------------------------------
 
     def _record_format_column_expansion(self) -> None:
-        """For ext_described_io programs: same-named fields between a written
-        file and the read files map column-to-column (confidence=inferred).
-        This is the classic RPG III externally-described move-corresponding
-        pattern; it is honest as 'inferred', never 'parsed'.
+        """Same-named fields between a written file and the read files map
+        column-to-column (confidence=inferred) — the classic RPG III
+        externally-described move-corresponding pattern; honest as
+        'inferred', never 'parsed'.
+
+        Gating is per *file*, not per program classification: a single
+        program-described work/printer F-spec used to disqualify the whole
+        program (live estate: XBRD, the sole writer of a 62-column DDL
+        output, classified program_described_or_complex — zero column
+        lineage). Only files whose own F-spec is program-described are
+        excluded: their records are byte buffers, so name matching would be
+        dishonest for them — but the program's externally described files
+        still participate.
         """
-        ext_programs = {
-            r[0] for r in self.con.execute(
-                "SELECT program FROM program_classification "
-                "WHERE program_class = 'ext_described_io'").fetchall()
-        }
-        if not ext_programs:
+        # Program short-name -> declared names of its PROGRAM-DESCRIBED
+        # F-specs (the byte-buffer files name matching must skip).
+        prog_described: dict[str, set[str]] = defaultdict(set)
+        rpg_programs: set[str] = set()
+        for program, fname, extname, pdesc in self.con.execute(
+                "SELECT program, file, extname, program_described "
+                "FROM parsed_rpg_files").fetchall():
+            short = str(program).split("/")[-1].upper()
+            rpg_programs.add(short)
+            if pdesc:
+                for nm in (fname, extname):
+                    if nm:
+                        prog_described[short].add(str(nm).strip().upper())
+        if not rpg_programs:
             return
 
         ffd = self._dspffd_fields()
@@ -872,8 +889,11 @@ class GraphBuilder:
             if not e.src.startswith("program:"):
                 continue
             pname = e.src.split(":", 1)[1]
-            if pname.split("/")[-1] not in {
-                    p.split("/")[-1] for p in ext_programs}:
+            short = pname.split("/")[-1].upper()
+            if short not in rpg_programs:
+                continue
+            if e.dst.split(":", 1)[1].split("/")[-1].split("(")[0] \
+                    in prog_described.get(short, ()):
                 continue
             if e.kind == EdgeKind.READS and e.dst.startswith("file:"):
                 reads[pname].add(e.dst)

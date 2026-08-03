@@ -460,7 +460,8 @@ def parse_all(con) -> dict[str, int]:
         prog = parse(m)
         for f in prog.files:
             file_rows.append((prog.program_id, f.file, f.usage, f.extname,
-                              f.rename_rec, f.declared_via))
+                              f.rename_rec, f.declared_via,
+                              bool(f.program_described)))
         for op in prog.io_ops:
             io_rows.append((prog.program_id, op.seq, op.opcode, op.file,
                             op.direction))
@@ -470,7 +471,7 @@ def parse_all(con) -> dict[str, int]:
             field_ref_rows.append((prog.program_id, fld))
     insert_rows(con, "parsed_rpg_files",
                 ["program", "file", "usage", "extname", "rename_rec",
-                 "declared_via"], file_rows)
+                 "declared_via", "program_described"], file_rows)
     insert_rows(con, "parsed_rpg_io_ops",
                 ["program", "seq", "opcode", "file", "direction"], io_rows)
     insert_rows(con, "parsed_rpg_field_refs",

@@ -108,3 +108,51 @@ def test_long_and_system_names_resolve_to_one_node():
     assert ("column:DTALIB/BROAST.CACINM",
             "column:DTALIB/SRCTXN.ATYPE") in derives
     con.close()
+
+
+def test_record_expansion_gates_per_file_not_per_program():
+    """One program-described work-file F-spec must no longer disqualify the
+    whole program (live XBRD case): externally described files still expand
+    by same-named fields; the byte-buffer file contributes nothing."""
+    from lineage import db as dbmod
+    from lineage.config import from_dict
+    from lineage.db import insert_rows
+    from lineage.graph.build import build_graph
+
+    con = dbmod.connect(None)
+    col_rows = []
+    for tbl in ("OUTF", "INF", "WRKF"):
+        for i, c in enumerate(("F1", "F2")):
+            col_rows.append(("APPX", tbl, tbl, c, c, i + 1, "CHAR", 10,
+                             None, "N", c))
+    insert_rows(con, "raw_syscolumns",
+                ["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal", "data_type", "length",
+                 "numeric_scale", "is_nullable", "column_heading"], col_rows)
+    insert_rows(con, "raw_dsppgmref",
+                ["program_lib", "program_name", "object_lib", "object_name",
+                 "object_type", "usage_flag", "ref_count"],
+                [("APPX", "MIXPGM", "APPX", "INF", "F", "1", 1),
+                 ("APPX", "MIXPGM", "APPX", "OUTF", "F", "2", 1),
+                 ("APPX", "MIXPGM", "APPX", "WRKF", "F", "2", 1)])
+    insert_rows(con, "parsed_rpg_files",
+                ["program", "file", "usage", "extname", "rename_rec",
+                 "declared_via", "program_described"],
+                [("APPX/MIXPGM", "INF", "input", None, None, "fspec", False),
+                 ("APPX/MIXPGM", "OUTF", "output", None, None, "fspec", False),
+                 ("APPX/MIXPGM", "WRKF", "output", None, None, "fspec", True)])
+    config = from_dict({
+        "scratch_lib": "QTEMP", "libraries": ["APPX"],
+        "output_seeds": [{"id": "O", "library": "APPX", "file": "OUTF"}],
+        "liblists": {"default": ["APPX"]},
+    })
+    g = build_graph(con, config, phase=3)
+    derives = [(u, v) for u, v, d in g.edges(data=True)
+               if d.get("kind") == "derives_from"]
+    # Externally described pair expands despite the program-described sibling
+    # (and despite MIXPGM having no classification row at all).
+    assert ("column:APPX/OUTF.F1", "column:APPX/INF.F1") in derives
+    assert ("column:APPX/OUTF.F2", "column:APPX/INF.F2") in derives
+    # The byte-buffer file stays out of name matching entirely.
+    assert not any("WRKF" in u or "WRKF" in v for u, v in derives)
+    con.close()

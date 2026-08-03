@@ -68,6 +68,7 @@ def apply_schema(con: duckdb.DuckDBPyConnection) -> None:
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("parsed_sql_statements", "columns_used", "VARCHAR"),
     ("output_lineage", "relation", "VARCHAR DEFAULT 'derives'"),
+    ("parsed_rpg_files", "program_described", "BOOLEAN"),
 )
 
 

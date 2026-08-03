@@ -175,7 +175,8 @@ CREATE TABLE IF NOT EXISTS parsed_rpg_files (
     usage          VARCHAR,   -- input/output/update/combined
     extname        VARCHAR,   -- EXTNAME / EXTFILE resolved external file
     rename_rec     VARCHAR,   -- RENAME record format
-    declared_via   VARCHAR    -- fspec / dclf
+    declared_via   VARCHAR,   -- fspec / dclf
+    program_described BOOLEAN  -- F in fspec col 19: record is a byte buffer
 );
 
 CREATE TABLE IF NOT EXISTS parsed_rpg_io_ops (
