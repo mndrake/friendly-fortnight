@@ -176,3 +176,22 @@ def test_query_command_reads_jsonl_without_store(tmp_path):
     assert result.exit_code == 0, result.output
     assert "catalog.systables" in result.output
     assert "[SQL0206] boom" in result.output
+
+
+def test_query_command_clean_error_no_traceback(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        "scratch_lib: QTEMP\nlibraries: [APPLIB]\n"
+        "output_seeds:\n  - id: X\n    library: APPLIB\n    file: OUT\n"
+        "storage:\n"
+        f"  duckdb: {tmp_path / 'no.duckdb'}\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, [
+        "query",
+        "SELECT * FROM read_json_auto('data/logs/host-calls-*.jsonl')",
+        "--config", str(cfg_path)])
+    assert result.exit_code == 1
+    assert "query error:" in result.output
+    assert "hint:" in result.output            # host-log-specific guidance
+    assert "Traceback" not in result.output

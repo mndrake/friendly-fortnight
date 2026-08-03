@@ -389,7 +389,17 @@ def query(sql: str = typer.Argument(
         # No store yet — still useful for read_json_auto over the logs.
         con = duckdb.connect()
     try:
-        res = con.execute(sql)
+        try:
+            res = con.execute(sql)
+        except Exception as exc:  # noqa: BLE001 - show one clean line
+            msg = str(exc).strip().splitlines()[0] if str(exc).strip() \
+                else repr(exc)
+            typer.secho(f"query error: {msg}", fg=typer.colors.RED, err=True)
+            if "host-calls" in sql and "No files found" in str(exc):
+                typer.echo("hint: host-call logs are written by "
+                           "`lineage extract` — run one first (they did not "
+                           "exist before that feature was pulled)", err=True)
+            raise typer.Exit(1)
         cols = [d[0] for d in res.description] if res.description else []
         rows = res.fetchall()
         if csv:
