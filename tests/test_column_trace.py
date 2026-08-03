@@ -157,3 +157,31 @@ def test_resolve_target_falls_back_to_syscolumns_identity():
     assert t.spec == "TNTACCDTA/BROAST"
     assert [c.sql_name for c in t.columns] == ["CACINM"]
     con.close()
+
+
+def test_diagnose_table_full_picture(built, config, tmp_path):
+    """diagnose_table over the fixture store: identity, writers, statements,
+    column edges, classification, slice audit, gap profile — all present."""
+    from lineage.analyze.diagnose import diagnose_table
+
+    con, _graph = built
+    out = "\n".join(diagnose_table(con, "APPLIB/CUSTRPT"))
+    assert "identity: APPLIB/CUSTRPT" in out
+    assert "file:APPLIB/CUSTRPT" in out
+    assert "writes: program:APPLIB/RPT001" in out
+    assert "column nodes:" in out
+    assert "gap profile" in out
+
+
+def test_diagnose_table_absent_everything():
+    """A table the store knows nothing about must produce a readable report,
+    not an exception."""
+    from lineage import db as dbmod
+    from lineage.analyze.diagnose import diagnose_table
+
+    con = dbmod.connect(None)
+    out = "\n".join(diagnose_table(con, "NOLIB/NOTABLE"))
+    assert "in_catalog=False" in out
+    assert "(none — the graph has no file node for this table)" in out
+    assert "(not in slice_objects)" in out
+    con.close()

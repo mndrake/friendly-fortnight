@@ -368,6 +368,24 @@ def report(config: str = _CONFIG_OPT,
 
 
 @app.command()
+def diagnose(table: str = typer.Option(
+                 ..., "--table", help="Table to diagnose, LIB/NAME"),
+             config: str = _CONFIG_OPT,
+             limit: int = typer.Option(12, help="Rows per section")) -> None:
+    """Explain why a table's lineage does or doesn't resolve, in one output:
+    identity, graph nodes, writers, SQL statements, column edges, writer
+    classification, slice audit, and the gap profile."""
+    cfg = _load(config)
+    con = _con(cfg)
+    try:
+        from .analyze.diagnose import diagnose_table
+        for line in diagnose_table(con, table, limit=limit):
+            typer.echo(line)
+    finally:
+        con.close()
+
+
+@app.command()
 def query(sql: str = typer.Argument(
               ..., help="SQL to run. The lineage store's tables are "
                         "directly queryable; host-call logs via "
