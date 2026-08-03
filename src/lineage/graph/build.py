@@ -44,6 +44,13 @@ class GraphBuilder:
         # column-usage pass (no re-parsing / re-resolving liblist).
         self._cpyf_events: list[dict] = []
         self._ffd_cache: Optional[dict[tuple[str, str], set[str]]] = None
+        # Long-SQL-name <-> system-name canonicalization, built from the
+        # catalog before any edges are minted. A DDL member writes
+        # EDS_BROKER_BARGAIN_EVENING while DSPPGMREF/DSPFFD/RPG know the
+        # same table as BROAST — without canonical node names the graph
+        # splits into two disconnected tables and lineage never meets.
+        self._canon_file: dict[tuple[str, str], str] = {}
+        self._canon_col: dict[tuple[str, str, str], str] = {}
 
     # -- helpers -------------------------------------------------------------
 
@@ -55,6 +62,9 @@ class GraphBuilder:
 
     def add_file_node(self, library: Optional[str], name: str,
                       member: Optional[str] = None, **attrs) -> str:
+        if library:
+            name = self._canon_file.get(
+                (library.upper(), name.strip().upper()), name)
         nid = file_id(library, name, member)
         self.add_node(Node(id=nid, kind=NodeKind.FILE, library=library,
                            name=name.upper(), attrs=attrs))
@@ -80,6 +90,16 @@ class GraphBuilder:
             return
         self._edge_keys.add(k)
         self.edges.append(edge)
+
+    def _col_id(self, library: Optional[str], table: str, col: str) -> str:
+        """column_id with canonical (system) table and column names."""
+        lib_u = (library or "").upper()
+        table_u = (table or "").strip().upper()
+        if library:
+            table_u = self._canon_file.get((lib_u, table_u), table_u)
+        col_u = (col or "").strip().upper()
+        col_u = self._canon_col.get((lib_u, table_u, col_u), col_u)
+        return column_id(library, table_u, col_u)
 
     def gap(self, kind: str, object_id: str, detail: str, context: dict | None = None) -> None:
         self.gaps.append((kind, object_id, detail,
@@ -124,6 +144,30 @@ class GraphBuilder:
         rows = self.con.execute(
             "SELECT table_schema, table_name, system_name, table_type "
             "FROM raw_systables").fetchall()
+        # Canonical-name maps first — node creation below and every edge
+        # pass afterwards mint ids through them.
+        for schema, name, sysname, _ttype in rows:
+            if not schema or not (name and sysname):
+                continue
+            lib_u = str(schema).strip().upper()
+            canon = str(sysname or name).strip().upper()
+            for label in (name, sysname):
+                self._canon_file[(lib_u, str(label).strip().upper())] = canon
+        for schema, name, sysname, colname, syscol in self.con.execute(
+                "SELECT table_schema, table_name, system_name, column_name, "
+                "system_column FROM raw_syscolumns").fetchall():
+            if not schema:
+                continue
+            lib_u = str(schema).strip().upper()
+            canon = str(sysname or name or "").strip().upper()
+            if name and sysname:
+                for label in (name, sysname):
+                    self._canon_file[(lib_u, str(label).strip().upper())] = canon
+            ccanon = str(syscol or colname or "").strip().upper()
+            if canon and ccanon and colname and syscol:
+                for clabel in (colname, syscol):
+                    self._canon_col[
+                        (lib_u, canon, str(clabel).strip().upper())] = ccanon
         for schema, name, sysname, ttype in rows:
             schema_s = (schema or "").strip()
             for label in {name, sysname} - {None}:
@@ -228,7 +272,7 @@ class GraphBuilder:
                 tgt = item["target"]
                 if tgt == "*":
                     continue
-                tgt_id = column_id(schema, name, tgt.split(".")[-1])
+                tgt_id = self._col_id(schema, name, tgt.split(".")[-1])
                 for src in item["sources"]:
                     src_id = self._column_ref_to_id(src)
                     if src_id is None:
@@ -250,7 +294,7 @@ class GraphBuilder:
         else:
             lib = self._resolve_lib(table_part, f"column ref {ref}")
             table = table_part
-        return column_id(lib, table, col)
+        return self._col_id(lib, table, col)
 
     # -- DDS -----------------------------------------------------------------
 
@@ -277,7 +321,7 @@ class GraphBuilder:
             "ref_field, ref_file, concat_fields FROM parsed_dds_fields"
         ).fetchall()
         for library, fname, recfmt, field_name, renamed, ref_field, ref_file, concat_json in fields:
-            lf_col = column_id(library, fname, field_name)
+            lf_col = self._col_id(library, fname, field_name)
             concat = json.loads(concat_json or "[]")
             sources: list[tuple[str, str]] = []  # (pf_name, pf_field)
             if concat and ref_file:
@@ -299,7 +343,7 @@ class GraphBuilder:
                 if plib is None:
                     plib = self._resolve_lib(pname, f"DDS field {lf_col}")
                 self.add_edge(Edge(src=lf_col,
-                                   dst=column_id(plib, pname, pf_field),
+                                   dst=self._col_id(plib, pname, pf_field),
                                    kind=EdgeKind.DERIVES_FROM,
                                    provenance=Provenance.DDS,
                                    confidence=Confidence.PARSED,
@@ -737,13 +781,13 @@ class GraphBuilder:
                 used = fields & program_refs
                 for f in sorted(used):
                     self.add_edge(Edge(
-                        src=pid, dst=column_id(lib, tf, f),
+                        src=pid, dst=self._col_id(lib, tf, f),
                         kind=EdgeKind.READS, provenance=Provenance.SOURCE_RPG,
                         confidence=Confidence.PARSED,
                         context={"mechanism": "field_reference"}))
                 for f in sorted(fields - used):
                     self.add_edge(Edge(
-                        src=pid, dst=column_id(lib, tf, f),
+                        src=pid, dst=self._col_id(lib, tf, f),
                         kind=EdgeKind.READS, provenance=Provenance.SOURCE_RPG,
                         confidence=Confidence.INFERRED,
                         context={"mechanism": "record_io_all_fields"}))
@@ -799,7 +843,7 @@ class GraphBuilder:
             for f in sorted(used):
                 self.add_edge(Edge(
                     src=ev["pid"],
-                    dst=column_id(ev["from_lib"], ev["from_file"], f),
+                    dst=self._col_id(ev["from_lib"], ev["from_file"], f),
                     kind=EdgeKind.READS, provenance=Provenance.SOURCE_CL,
                     confidence=confidence, context={"mechanism": mechanism}))
 
@@ -855,8 +899,8 @@ class GraphBuilder:
                     common = wfields & rfields
                     for f in common:
                         self.add_edge(Edge(
-                            src=column_id(wkey[0], wkey[1], f),
-                            dst=column_id(rkey[0], rkey[1], f),
+                            src=self._col_id(wkey[0], wkey[1], f),
+                            dst=self._col_id(rkey[0], rkey[1], f),
                             kind=EdgeKind.DERIVES_FROM,
                             provenance=Provenance.SOURCE_RPG,
                             confidence=Confidence.INFERRED,
