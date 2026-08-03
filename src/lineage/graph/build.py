@@ -24,6 +24,12 @@ from .model import (Confidence, Edge, EdgeKind, Node, NodeKind, Provenance,
 from .resolve import (CallSite, LiblistResolver, Override, simulate_call_tree)
 
 
+def _col_file_spec(col_node: str) -> str:
+    """``column:LIB/FILE.COL`` -> ``LIB/FILE``."""
+    body = col_node.split(":", 1)[1]
+    return body.rsplit(".", 1)[0]
+
+
 class GraphBuilder:
     def __init__(self, con, config, phase: int = 3):
         self.con = con
@@ -124,6 +130,7 @@ class GraphBuilder:
         self._view_column_lineage()
         if self.phase >= 2:
             self._edges_from_dds()
+            self._lf_column_passthrough()
             self._overrides = self._simulate_overrides()
             self._edges_from_cl()
             self._apply_overrides_to_xref()
@@ -348,6 +355,52 @@ class GraphBuilder:
                                    provenance=Provenance.DDS,
                                    confidence=Confidence.PARSED,
                                    context={"renamed_from": renamed} if renamed else {}))
+
+    def _lf_column_passthrough(self) -> None:
+        """Column passthrough for logicals whose DDS source wasn't parsed.
+
+        Parsed DDS is the best evidence for LF -> PF column lineage (it
+        handles renames, JREFs, concatenations). But a live estate retrieves
+        source for the slice, not for every dependent logical — a trace then
+        stops at the LF as if it were a base file, which is exactly wrong
+        for a physical-table-focused analysis. DSPDBR already proves the
+        file-level dependency and the catalog knows both field sets, and a
+        non-join logical exposes its base file's fields under the same
+        names — so same-named columns pass through at inferred confidence.
+        Files that already have parsed evidence (DDS field maps, view
+        definitions) are skipped: parsed beats synthesized.
+        """
+        # File specs that already carry column-derives evidence from their
+        # own definition — don't second-guess them.
+        has_parsed: set[str] = set()
+        for e in self.edges:
+            if e.kind == EdgeKind.DERIVES_FROM and e.src.startswith("column:"):
+                has_parsed.add(_col_file_spec(e.src))
+
+        ffd = self._dspffd_fields()
+        for dlib, dfile, blib, bfile in self.con.execute(
+                "SELECT DISTINCT dep_lib, dep_file, based_lib, based_file "
+                "FROM raw_dspdbr").fetchall():
+            if not (dlib and dfile and blib and bfile):
+                continue
+            dep_id = self.add_file_node(dlib, dfile)
+            base_id = self.add_file_node(blib, bfile)
+            if dep_id == base_id:
+                continue
+            dep_spec = dep_id.split(":", 1)[1]
+            if dep_spec in has_parsed:
+                continue
+            dkey = tuple(dep_spec.split("/", 1))
+            bkey = tuple(base_id.split(":", 1)[1].split("/", 1))
+            common = ffd.get(dkey, set()) & ffd.get(bkey, set())
+            for f in sorted(common):
+                self.add_edge(Edge(
+                    src=self._col_id(dkey[0], dkey[1], f),
+                    dst=self._col_id(bkey[0], bkey[1], f),
+                    kind=EdgeKind.DERIVES_FROM,
+                    provenance=Provenance.XREF,
+                    confidence=Confidence.INFERRED,
+                    context={"mechanism": "lf_field_passthrough"}))
 
     @staticmethod
     def _split_qualified(name: str) -> tuple[Optional[str], str]:

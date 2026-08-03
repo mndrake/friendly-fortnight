@@ -156,3 +156,90 @@ def test_record_expansion_gates_per_file_not_per_program():
     # The byte-buffer file stays out of name matching entirely.
     assert not any("WRKF" in u or "WRKF" in v for u, v in derives)
     con.close()
+
+
+def test_lf_passthrough_bridges_unparsed_logicals():
+    """A logical with no parsed DDS (source never retrieved) must still pass
+    its columns through to the base physical via DSPDBR + shared catalog
+    fields — a trace stopping at EITFDTA# as 'base' was exactly wrong."""
+    from lineage import db as dbmod
+    from lineage.config import from_dict
+    from lineage.db import insert_rows
+    from lineage.graph.build import build_graph
+
+    con = dbmod.connect(None)
+    cols = []
+    for tbl in ("EITFDTA", "EITFDTA#"):
+        for i, c in enumerate(("YETFDL", "METFDL")):
+            cols.append(("DTAL", tbl, tbl, c, c, i + 1, "CHAR", 8, None,
+                         "N", c))
+    insert_rows(con, "raw_syscolumns",
+                ["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal", "data_type", "length",
+                 "numeric_scale", "is_nullable", "column_heading"], cols)
+    insert_rows(con, "raw_dspdbr",
+                ["dep_lib", "dep_file", "based_lib", "based_file",
+                 "dep_type"],
+                [("DTAL", "EITFDTA#", "DTAL", "EITFDTA", "D")])
+    config = from_dict({
+        "scratch_lib": "QTEMP", "libraries": ["DTAL"],
+        "output_seeds": [{"id": "X", "library": "DTAL", "file": "EITFDTA#"}],
+        "liblists": {"default": ["DTAL"]},
+    })
+    g = build_graph(con, config, phase=3)
+    derives = [(u, v, d) for u, v, d in g.edges(data=True)
+               if d.get("kind") == "derives_from"]
+    assert any(u == "column:DTAL/EITFDTA#.YETFDL"
+               and v == "column:DTAL/EITFDTA.YETFDL"
+               and d.get("context", {}).get("mechanism") ==
+               "lf_field_passthrough"
+               for u, v, d in derives)
+    con.close()
+
+
+def test_lf_passthrough_defers_to_parsed_dds():
+    """A logical whose DDS was parsed (rename-aware evidence) must NOT get
+    synthesized same-name passthrough edges layered on top."""
+    import json as jsonmod
+
+    from lineage import db as dbmod
+    from lineage.config import from_dict
+    from lineage.db import insert_rows
+    from lineage.graph.build import build_graph
+
+    con = dbmod.connect(None)
+    cols = []
+    for tbl in ("BASEPF", "RENLF"):
+        cols.append(("DTAL", tbl, tbl, "CNAME", "CNAME", 1, "CHAR", 8,
+                     None, "N", "x"))
+    insert_rows(con, "raw_syscolumns",
+                ["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal", "data_type", "length",
+                 "numeric_scale", "is_nullable", "column_heading"], cols)
+    insert_rows(con, "raw_dspdbr",
+                ["dep_lib", "dep_file", "based_lib", "based_file",
+                 "dep_type"],
+                [("DTAL", "RENLF", "DTAL", "BASEPF", "D")])
+    insert_rows(con, "parsed_dds_files",
+                ["library", "file", "dds_type", "record_format", "based_on",
+                 "is_join"],
+                [("DTAL", "RENLF", "LF", "RENLFR",
+                  jsonmod.dumps(["BASEPF"]), False)])
+    insert_rows(con, "parsed_dds_fields",
+                ["library", "file", "record_format", "field_name",
+                 "renamed_from", "ref_field", "ref_file", "concat_fields",
+                 "usage"],
+                [("DTAL", "RENLF", "RENLFR", "CNAME", "CUSTNAME",
+                  "CUSTNAME", "BASEPF", None, "B")])
+    config = from_dict({
+        "scratch_lib": "QTEMP", "libraries": ["DTAL"],
+        "output_seeds": [{"id": "X", "library": "DTAL", "file": "RENLF"}],
+        "liblists": {"default": ["DTAL"]},
+    })
+    g = build_graph(con, config, phase=3)
+    mechs = {d.get("context", {}).get("mechanism")
+             for u, v, d in g.edges(data=True)
+             if d.get("kind") == "derives_from"
+             and u.startswith("column:DTAL/RENLF.")}
+    assert "lf_field_passthrough" not in mechs   # parsed DDS won
+    con.close()
