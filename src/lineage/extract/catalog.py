@@ -230,6 +230,19 @@ def _fetch(session: HostSession, tag: str, sql: str) -> QueryResult:
     return session.query(sql)
 
 
+def _strip_row(row) -> tuple:
+    """Trim string values before they land in the raw store.
+
+    IBM i catalog CHAR columns (SYSTEM_TABLE_NAME is CHAR(10)) come back
+    space-padded over JDBC: ``'BROAST    '``. The padding carries no
+    information and silently breaks every equality comparison downstream —
+    the live symptom was scoped pulls whose WHERE matched on the host while
+    the client-side row filter rejected every row, leaving system-named
+    tables with no catalog identity at all.
+    """
+    return tuple(v.strip() if isinstance(v, str) else v for v in row)
+
+
 def harvest(session: HostSession, con, config,
             profile: HostProfile | None = None,
             only: dict[str, Sequence[tuple[str, str]]] | None = None,
@@ -273,10 +286,10 @@ def harvest(session: HostSession, con, config,
             for row in con.execute(
                     f"SELECT DISTINCT {lib_col}, {name_col}{sys_sel} "
                     f"FROM {spec.raw_table}").fetchall():
-                lib_u = (row[0] or "").upper()
-                existing.add((lib_u, (row[1] or "").upper()))
+                lib_u = (row[0] or "").strip().upper()
+                existing.add((lib_u, (row[1] or "").strip().upper()))
                 if sys_idx is not None and row[2]:
-                    existing.add((lib_u, str(row[2]).upper()))
+                    existing.add((lib_u, str(row[2]).strip().upper()))
             todo_set = {(l.upper(), n.upper()) for l, n in pairs} - existing
             todo = sorted(todo_set)
             if not todo:
@@ -297,12 +310,13 @@ def harvest(session: HostSession, con, config,
                 alt_col = sys_col_spec.candidates[0]
 
             def _wanted(r: tuple) -> bool:
-                lib_u = str(r[0] or "").upper()
-                if (lib_u, str(r[1] or "").upper()) in todo_set:
+                lib_u = str(r[0] or "").strip().upper()
+                if (lib_u, str(r[1] or "").strip().upper()) in todo_set:
                     return True
                 return (sys_idx is not None and sys_idx < len(r)
                         and r[sys_idx] is not None
-                        and (lib_u, str(r[sys_idx]).upper()) in todo_set)
+                        and (lib_u, str(r[sys_idx]).strip().upper())
+                        in todo_set)
 
             rows: list[tuple] = []
             missing: list[str] = []
@@ -326,7 +340,7 @@ def harvest(session: HostSession, con, config,
                         sql, missing_try = spec.build_select(
                             sel_available, None, extra_where=frag)
                         res = _fetch(session, f"catalog.{spec.name}", sql)
-                        rows_try.extend(tuple(r) for r in res.rows
+                        rows_try.extend(_strip_row(r) for r in res.rows
                                         if _wanted(tuple(r)))
                 except CatalogShapeError:
                     raise
@@ -359,6 +373,6 @@ def harvest(session: HostSession, con, config,
         res = _fetch(session, f"catalog.{spec.name}", sql)
         counts[spec.raw_table] = insert_rows(
             con, spec.raw_table, RAW_COLUMNS[spec.raw_table],
-            [tuple(r) for r in res.rows])
+            [_strip_row(r) for r in res.rows])
         p.done(f"catalog {spec.name}", rows=counts[spec.raw_table])
     return counts

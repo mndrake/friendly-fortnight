@@ -1191,3 +1191,51 @@ def test_speculative_system_name_retries_without_on_host_rejection():
     assert any("SYSTEM_TABLE_NAME" not in q and "SYSTABLES" in q
                for q in session.sql_log)                            # retried
     con.close()
+
+
+# --- CHAR padding: JDBC returns 'BROAST    ' for CHAR(10) system names ---------
+
+def test_scoped_pull_keeps_and_strips_padded_system_names():
+    """The host WHERE matches the padded CHAR value, so the client-side row
+    filter must too — live symptom was ok=True queries inserting 0 rows,
+    leaving system-named tables with no catalog identity."""
+    from lineage.extract import catalog
+
+    session = FixtureHostSession(responses={
+        "catalog.systables": QueryResult(
+            columns=["table_schema", "table_name", "system_name",
+                     "table_type", "file_type", "row_count", "long_comment"],
+            rows=[("TNTACCDTA", "EDS_BROKER_BARGAIN_EVENING", "BROAST    ",
+                   "T ", "D", 1, None)]),
+    })
+    con = dbmod.connect(None)
+    counts = catalog.harvest(
+        session, con, _synthetic_config(),
+        only={"SYSTABLES": [("TNTACCDTA", "BROAST")], "SYSCOLUMNS": [],
+              "SYSPARTITIONSTAT": [], "SYSVIEWS": [], "SYSVIEWDEP": []})
+
+    assert counts["raw_systables"] == 1        # padded row accepted...
+    row = con.execute(
+        "SELECT system_name, table_type FROM raw_systables").fetchone()
+    assert row == ("BROAST", "T")              # ...and stored stripped
+    con.close()
+
+
+def test_resolve_target_tolerates_padded_legacy_store():
+    """Stores written before insert-time stripping carry padded values; the
+    trim()-based lookups must still resolve identity."""
+    from lineage.analyze.column_trace import resolve_target
+    from lineage.db import insert_rows
+
+    con = dbmod.connect(None)
+    insert_rows(con, "raw_syscolumns",
+                ["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal", "data_type", "length",
+                 "numeric_scale", "is_nullable", "column_heading"],
+                [("TNTACCDTA", "EDS_BROKER_BARGAIN_EVENING", "BROAST    ",
+                  "CACINM    ", "CACINM    ", 1, "DECIMAL", 9, 2, "N", "x")])
+    t = resolve_target(con, "TNTACCDTA/BROAST")
+    assert t.in_catalog
+    assert t.name == "BROAST"
+    assert [c.sql_name for c in t.columns] == ["CACINM"]
+    con.close()

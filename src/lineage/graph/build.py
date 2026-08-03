@@ -125,10 +125,13 @@ class GraphBuilder:
             "SELECT table_schema, table_name, system_name, table_type "
             "FROM raw_systables").fetchall()
         for schema, name, sysname, ttype in rows:
+            schema_s = (schema or "").strip()
             for label in {name, sysname} - {None}:
-                self._catalog_objects.add((schema.upper(), label.upper()))
+                self._catalog_objects.add(
+                    (schema_s.upper(), str(label).strip().upper()))
             kind_attr = {"table_type": ttype}
-            self.add_file_node(schema, sysname or name, **kind_attr)
+            self.add_file_node(schema_s, str(sysname or name).strip(),
+                               **kind_attr)
         # raw_syscolumns is the same SQL catalog under another view: a store
         # whose extract scope-pulled SYSCOLUMNS but not SYSTABLES (older
         # runs) must still let the liblist resolver place unqualified
@@ -140,7 +143,8 @@ class GraphBuilder:
             if not schema:
                 continue
             for label in {name, sysname} - {None}:
-                self._catalog_objects.add((schema.upper(), str(label).upper()))
+                self._catalog_objects.add(
+                    (schema.strip().upper(), str(label).strip().upper()))
         self.resolver = LiblistResolver(
             liblist=self.config.liblist(None),
             objects=self._catalog_objects,

@@ -75,16 +75,21 @@ def resolve_target(con, table_arg: str) -> Target:
     """
     lib, name = _split_table_arg(table_arg)
 
+    # trim(): CHAR catalog columns (SYSTEM_TABLE_NAME) arrive space-padded
+    # over JDBC; stores written before values were stripped at insert still
+    # carry the padding, and equality against the trimmed argument must not
+    # miss because of it.
     row = con.execute(
         "SELECT table_schema, table_name, system_name, table_type "
         "FROM raw_systables "
-        "WHERE upper(table_schema) = ? "
-        "AND (upper(table_name) = ? OR upper(system_name) = ?) LIMIT 1",
+        "WHERE upper(trim(table_schema)) = ? "
+        "AND (upper(trim(table_name)) = ? OR upper(trim(system_name)) = ?) "
+        "LIMIT 1",
         [lib, name, name],
     ).fetchone()
     if row is not None:
         _, table_name, system_name, table_type = row
-        canonical = (system_name or table_name or name).upper()
+        canonical = ((system_name or table_name or name).strip() or name).upper()
         in_catalog = True
     else:
         # raw_syscolumns is the same SQL catalog: a store from an extract
@@ -92,13 +97,15 @@ def resolve_target(con, table_arg: str) -> Target:
         # proves the table exists and yields its canonical/system name.
         cat_row = con.execute(
             "SELECT table_name, system_name FROM raw_syscolumns "
-            "WHERE upper(table_schema) = ? "
-            "AND (upper(table_name) = ? OR upper(system_name) = ?) LIMIT 1",
+            "WHERE upper(trim(table_schema)) = ? "
+            "AND (upper(trim(table_name)) = ? OR upper(trim(system_name)) = ?) "
+            "LIMIT 1",
             [lib, name, name],
         ).fetchone()
         if cat_row is not None:
             table_name, system_name = cat_row
-            canonical = (system_name or table_name or name).upper()
+            canonical = ((system_name or table_name or name).strip()
+                         or name).upper()
             table_type, in_catalog = None, True
         else:
             canonical, table_type, in_catalog = name, None, False
@@ -108,15 +115,15 @@ def resolve_target(con, table_arg: str) -> Target:
     columns: list[TargetColumn] = []
     cat = con.execute(
         "SELECT column_name, system_column, ordinal FROM raw_syscolumns "
-        "WHERE upper(table_schema) = ? "
-        "AND (upper(table_name) = ? OR upper(system_name) = ?) "
+        "WHERE upper(trim(table_schema)) = ? "
+        "AND (upper(trim(table_name)) = ? OR upper(trim(system_name)) = ?) "
         "ORDER BY ordinal",
         [lib, name, name],
     ).fetchall()
     for column_name, system_column, ordinal in cat:
         columns.append(TargetColumn(
-            sql_name=(column_name or system_column or "").upper(),
-            sys_name=(system_column or "").upper() or None,
+            sql_name=(column_name or system_column or "").strip().upper(),
+            sys_name=(system_column or "").strip().upper() or None,
             ordinal=ordinal))
 
     # Fallbacks when the SQL catalog has no columns for this table (e.g. a

@@ -172,7 +172,7 @@ def _systables_types(con) -> dict[tuple[str, str], str]:
         t = (str(ttype) if ttype is not None else "").strip().upper()
         for nm in (name, sysname):
             if nm:
-                out[(lib, str(nm).upper())] = t
+                out[(lib.strip(), str(nm).strip().upper())] = t
     return out
 
 

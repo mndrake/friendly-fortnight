@@ -171,11 +171,11 @@ def _catalog_present_pairs(con) -> set[tuple[str, str]]:
     for schema, name, sysname in con.execute(
             "SELECT DISTINCT table_schema, table_name, system_name "
             "FROM raw_syscolumns").fetchall():
-        lib = (schema or "").upper()
+        lib = (schema or "").strip().upper()
         if name:
-            present.add((lib, str(name).upper()))
+            present.add((lib, str(name).strip().upper()))
         if sysname:
-            present.add((lib, str(sysname).upper()))
+            present.add((lib, str(sysname).strip().upper()))
     return present
 
 
@@ -195,8 +195,8 @@ def _system_name_map(con) -> dict[tuple[str, str], str]:
                 f"SELECT DISTINCT table_schema, table_name, system_name "
                 f"FROM {src}").fetchall():
             if schema and name and sysname:
-                out[(str(schema).upper(), str(name).upper())] = \
-                    str(sysname).upper()
+                out[(str(schema).strip().upper(),
+                     str(name).strip().upper())] = str(sysname).strip().upper()
     return out
 
 
