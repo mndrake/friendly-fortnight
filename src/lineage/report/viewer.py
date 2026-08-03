@@ -180,9 +180,67 @@ def _worse_conf(a: str, b: str) -> str:
     return a if _CONF_RANK.get(a, 0) <= _CONF_RANK.get(b, 0) else b
 
 
+def _column_evidence(graph: nx.MultiDiGraph) -> dict[tuple[str, str], int]:
+    """File-spec pairs with direct column-level derivation evidence.
+
+    DSPPGMREF says a program *binds* a file — reference and validation files
+    pulled in via copybooks land there too, so "program reads F, writes O"
+    alone fans an output's feeder list out to half the estate. A
+    ``derives_from`` edge between column nodes is the stronger claim: a
+    specific field of the downstream file provably comes from a specific
+    field of the upstream one. Returns ``(upstream_spec, downstream_spec) ->
+    number of column derivations`` for every adjacent file pair.
+    """
+    pairs: dict[tuple[str, str], int] = defaultdict(int)
+    for u, v, d in graph.edges(data=True):
+        if d.get("kind") != "derives_from":
+            continue
+        if not (isinstance(u, str) and u.startswith("column:")
+                and isinstance(v, str) and v.startswith("column:")):
+            continue
+        down, up = _file_spec_of(u), _file_spec_of(v)
+        if up != down:
+            pairs[(up, down)] += 1
+    return dict(pairs)
+
+
+def _transitive_evidence(pairs: dict[tuple[str, str], int],
+                         kept_specs: set[str]) -> dict[tuple[str, str], int]:
+    """Project adjacent-file evidence onto kept (physical) pairs.
+
+    Column derivations hop through logical files and views (OUT.C <- LF.C <-
+    PF.C), but the physical view contracts those intermediates away — so the
+    evidence must be walked the same way: from each kept spec, follow
+    evidence pairs downstream through non-kept specs until another kept spec
+    is reached. The count carried is the bottleneck (min) along the path,
+    best path wins — a defensible "at least N columns flow" for the tooltip.
+    """
+    adj: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    for (up, down), cnt in pairs.items():
+        adj[up].append((down, cnt))
+    out: dict[tuple[str, str], int] = {}
+    for src in kept_specs:
+        seen = {src}
+        stack = list(adj.get(src, ()))
+        while stack:
+            spec, cnt = stack.pop()
+            if spec in kept_specs:
+                key = (src, spec)
+                if cnt > out.get(key, 0):
+                    out[key] = cnt
+                continue
+            if spec in seen:
+                continue
+            seen.add(spec)
+            for down, cnt2 in adj.get(spec, ()):
+                stack.append((down, min(cnt, cnt2)))
+    return out
+
+
 def _physical_flow(nodes: dict[str, _DagNode], edges: list[dict],
-                   types: dict[tuple[str, str], str]
-                   ) -> tuple[dict[str, _DagNode], list[dict]]:
+                   types: dict[tuple[str, str], str],
+                   graph: Optional[nx.MultiDiGraph] = None
+                   ) -> tuple[dict[str, _DagNode], list[dict], dict]:
     """Contract the raw cone down to physical-table-to-physical-table flow.
 
     The audience question is "which physical SQL tables feed this output?" —
@@ -192,6 +250,14 @@ def _physical_flow(nodes: dict[str, _DagNode], edges: list[dict],
     contracted path, and the programs traversed ride along as a ``via`` list
     for the tooltip. Files with no SYSTABLES row (device files, unresolved
     references) stay as gray nodes — hiding them would fake certainty.
+
+    When ``graph`` is given and carries column-level ``derives_from`` edges,
+    the contracted arrows are additionally filtered to pairs backed by
+    column evidence (see ``_column_evidence``): compiled file references
+    that never contribute a field are relegated to the detailed spine. If
+    the seed itself has no evidenced incoming arrow the filter is skipped
+    entirely (better an over-full picture than a falsely empty one); the
+    returned stats dict says which way it went.
     """
     # Data-flow adjacency (direction = the way rows move).
     flow: dict[str, list[tuple[str, str]]] = defaultdict(list)
@@ -243,6 +309,23 @@ def _physical_flow(nodes: dict[str, _DagNode], edges: list[dict],
             for w, conf2 in flow.get(v, ()):
                 stack.append((w, _worse_conf(conf, conf2), nvia))
 
+    flow_stats = {"connections_total": len(contracted),
+                  "connections_dropped": 0, "evidence_applied": False}
+    evidence = _column_evidence(graph) if graph is not None else {}
+    if evidence and contracted:
+        spec_of = {nid: nodes[nid].spec for nid in kept_ids}
+        ev = _transitive_evidence(evidence, set(spec_of.values()))
+        filtered = {key: e for key, e in contracted.items()
+                    if (spec_of[key[0]], spec_of[key[1]]) in ev}
+        seeds = {nid for nid in kept_ids if nodes[nid].is_seed}
+        if any(dst in seeds for (_src, dst) in filtered):
+            for (src, dst), e in filtered.items():
+                e["cols"] = ev[(spec_of[src], spec_of[dst])]
+            flow_stats["connections_dropped"] = (len(contracted)
+                                                - len(filtered))
+            flow_stats["evidence_applied"] = True
+            contracted = filtered
+
     # Depth = contracted hops upstream of the seed (reverse BFS); nodes with
     # no contracted path to the seed carry no data into it — drop them.
     incoming: dict[str, list[str]] = defaultdict(list)
@@ -269,7 +352,7 @@ def _physical_flow(nodes: dict[str, _DagNode], edges: list[dict],
                                  unknown=(_category(n) == "unknown"))
     out_edges = [e for (src, dst), e in contracted.items()
                  if src in out_nodes and dst in out_nodes]
-    return out_nodes, out_edges
+    return out_nodes, out_edges, flow_stats
 
 
 # --- table/program DAG: pruning to the data-flow spine --------------------------
@@ -426,6 +509,8 @@ def _render_svg(nodes: dict[str, _DagNode], edges: list[dict],
         if via:
             shown_via = ", ".join(via[:4]) + ("…" if len(via) > 4 else "")
             kind_txt += f" via {shown_via}"
+        if e.get("cols"):
+            kind_txt += f", {e['cols']} column derivation(s)"
         incident[e["src"]].append({"dir": "out", "other": e["dst"],
                                    "kind": kind_txt,
                                    "provenance": e["provenance"],
@@ -834,8 +919,8 @@ def _render_page(con, graph: nx.MultiDiGraph, seed) -> str:
     # Primary view: physical SQL tables only — programs/LFs/views contracted
     # into the arrows (the audience question is where the data *lives*, not
     # every hop it takes). The detailed spine stays one click away.
-    phys_nodes, phys_edges = _physical_flow(
-        raw_nodes, raw_edges, _systables_types(con))
+    phys_nodes, phys_edges, flow_stats = _physical_flow(
+        raw_nodes, raw_edges, _systables_types(con), graph)
     phys_nodes, phys_edges, phys_stats = _prune(phys_nodes, phys_edges)
     pw, ph = _layout(phys_nodes, phys_edges)
     phys_svg = _render_svg(phys_nodes, phys_edges, pw, ph, dom_id="dag-phys")
@@ -858,6 +943,20 @@ def _render_page(con, graph: nx.MultiDiGraph, seed) -> str:
         "nodes are files with no SYSTABLES row (device files or unresolved "
         "references); arrow color is the weakest confidence on the "
         "contracted path.")
+    if flow_stats.get("evidence_applied"):
+        shown = (flow_stats["connections_total"]
+                 - flow_stats["connections_dropped"])
+        phys_note += (
+            f" Arrows are limited to connections backed by column-level "
+            f"derivations ({shown} of {flow_stats['connections_total']} "
+            f"contracted connections qualify; the rest are compiled file "
+            f"references &mdash; files a program binds without evidence of "
+            f"contributing a field &mdash; still visible in the detailed "
+            f"graph below).")
+    elif flow_stats.get("connections_total"):
+        phys_note += (" No column-level derivation evidence reaches this "
+                      "seed, so all contracted connections are shown "
+                      "unfiltered.")
     if phys_stats.get("nodes_beyond_cut"):
         phys_note += (f" Showing depth &le; {phys_stats['depth_cap']} of "
                       f"{phys_stats['max_depth']}; dash-outlined nodes have "

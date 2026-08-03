@@ -209,3 +209,88 @@ def test_physical_view_contracts_programs_and_logical_files(built, config):
     assert "Physical table flow" in page
     # The detailed spine is still there, one click away.
     assert "Detailed table / program graph" in page
+    # Column-level evidence exists for this seed, so the filter is on and
+    # the page says so; arrow tooltips carry the derivation counts.
+    assert "backed by column-level" in page
+    assert "column derivation(s)" in phys_svg
+
+
+# --- Physical-table flow: column-evidence filtering ----------------------------
+
+def _flow_fixture():
+    """A seed OUT written by P1, which binds two physical files: FEEDER
+    contributes a column (derives_from evidence), REFONLY is merely read
+    (a compiled reference, DSPPGMREF-style)."""
+    import networkx as nx
+
+    def dn(nid, kind, name, seed=False):
+        spec = f"{LIB}/{name}"
+        return viewer._DagNode(id=nid, kind=kind, library=LIB, name=name,
+                               depth=0, is_seed=seed, label=spec, spec=spec)
+
+    nodes = {
+        f"file:{LIB}/OUT": dn(f"file:{LIB}/OUT", "file", "OUT", seed=True),
+        f"file:{LIB}/FEEDER": dn(f"file:{LIB}/FEEDER", "file", "FEEDER"),
+        f"file:{LIB}/REFONLY": dn(f"file:{LIB}/REFONLY", "file", "REFONLY"),
+        f"program:{LIB}/P1": dn(f"program:{LIB}/P1", "program", "P1"),
+    }
+    edges = [
+        {"src": f"program:{LIB}/P1", "dst": f"file:{LIB}/FEEDER",
+         "kind": "reads", "provenance": "pgmref", "confidence": "inferred"},
+        {"src": f"program:{LIB}/P1", "dst": f"file:{LIB}/REFONLY",
+         "kind": "reads", "provenance": "pgmref", "confidence": "inferred"},
+        {"src": f"program:{LIB}/P1", "dst": f"file:{LIB}/OUT",
+         "kind": "writes", "provenance": "pgmref", "confidence": "inferred"},
+    ]
+    types = {(LIB, "OUT"): "T", (LIB, "FEEDER"): "P", (LIB, "REFONLY"): "P"}
+    g = nx.MultiDiGraph()
+    return nodes, edges, types, g
+
+
+def test_physical_flow_drops_feeders_without_column_evidence():
+    nodes, edges, types, g = _flow_fixture()
+    g.add_edge(f"column:{LIB}/OUT.C1", f"column:{LIB}/FEEDER.C1",
+               kind="derives_from")
+    out_nodes, out_edges, stats = viewer._physical_flow(
+        nodes, edges, types, g)
+    assert f"file:{LIB}/FEEDER" in out_nodes
+    assert f"file:{LIB}/REFONLY" not in out_nodes   # touched, not contributing
+    assert stats["evidence_applied"] is True
+    assert stats["connections_dropped"] == 1
+    (edge,) = out_edges
+    assert edge["cols"] == 1
+
+
+def test_physical_flow_evidence_walks_through_intermediates():
+    """Evidence hops through a logical file (OUT.C <- LF.C <- FEEDER.C) must
+    still count for the contracted FEEDER -> OUT arrow — the LF is not a
+    kept node, so the evidence is projected across it."""
+    nodes, edges, types, g = _flow_fixture()
+    g.add_edge(f"column:{LIB}/OUT.C1", f"column:{LIB}/LF1.C1",
+               kind="derives_from")
+    g.add_edge(f"column:{LIB}/OUT.C2", f"column:{LIB}/LF1.C2",
+               kind="derives_from")
+    g.add_edge(f"column:{LIB}/LF1.C1", f"column:{LIB}/FEEDER.C1",
+               kind="derives_from")
+    g.add_edge(f"column:{LIB}/LF1.C2", f"column:{LIB}/FEEDER.C2",
+               kind="derives_from")
+    out_nodes, out_edges, stats = viewer._physical_flow(
+        nodes, edges, types, g)
+    assert f"file:{LIB}/FEEDER" in out_nodes
+    assert f"file:{LIB}/REFONLY" not in out_nodes
+    (edge,) = out_edges
+    assert edge["cols"] == 2
+
+
+def test_physical_flow_falls_back_when_seed_has_no_evidence():
+    """A seed with zero evidenced incoming arrows keeps the unfiltered
+    contraction — an over-full picture beats a falsely empty one."""
+    nodes, edges, types, g = _flow_fixture()
+    # Evidence exists in the graph, but none of it reaches OUT.
+    g.add_edge(f"column:{LIB}/ELSEWHERE.X", f"column:{LIB}/FEEDER.C1",
+               kind="derives_from")
+    out_nodes, out_edges, stats = viewer._physical_flow(
+        nodes, edges, types, g)
+    assert stats["evidence_applied"] is False
+    assert {f"file:{LIB}/FEEDER", f"file:{LIB}/REFONLY"} <= set(out_nodes)
+    assert len(out_edges) == 2
