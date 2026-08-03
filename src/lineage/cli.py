@@ -367,6 +367,56 @@ def report(config: str = _CONFIG_OPT,
         con.close()
 
 
+@app.command()
+def query(sql: str = typer.Argument(
+              ..., help="SQL to run. The lineage store's tables are "
+                        "directly queryable; host-call logs via "
+                        "read_json_auto('data/logs/host-calls-*.jsonl')"),
+          config: str = _CONFIG_OPT,
+          csv: bool = typer.Option(False, "--csv",
+                                   help="Emit CSV instead of a table")) -> None:
+    """Ad-hoc SQL against the DuckDB store (read-only) and the JSONL logs."""
+    import csv as csvmod
+    import sys
+
+    import duckdb
+
+    cfg = _load(config)
+    path = cfg.duckdb_path
+    if path and Path(path).exists():
+        con = duckdb.connect(path, read_only=True)
+    else:
+        # No store yet — still useful for read_json_auto over the logs.
+        con = duckdb.connect()
+    try:
+        res = con.execute(sql)
+        cols = [d[0] for d in res.description] if res.description else []
+        rows = res.fetchall()
+        if csv:
+            w = csvmod.writer(sys.stdout)
+            w.writerow(cols)
+            w.writerows(rows)
+            return
+        if not cols:
+            typer.echo("(no result set)")
+            return
+        widths = [min(max(len(str(c)), *(len(str(r[i])) for r in rows))
+                      if rows else len(str(c)), 80)
+                  for i, c in enumerate(cols)]
+
+        def _fmt_row(vals) -> str:
+            return " | ".join(
+                str(v)[:80].ljust(w) for v, w in zip(vals, widths))
+
+        typer.echo(_fmt_row(cols))
+        typer.echo("-+-".join("-" * w for w in widths))
+        for r in rows:
+            typer.echo(_fmt_row(r))
+        typer.echo(f"({len(rows)} row{'s' if len(rows) != 1 else ''})")
+    finally:
+        con.close()
+
+
 @app.command(name="sql-errors")
 def sql_errors(config: str = _CONFIG_OPT,
                limit: int = typer.Option(

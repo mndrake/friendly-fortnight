@@ -123,3 +123,56 @@ def test_sql_errors_empty_store(tmp_path):
     result = runner.invoke(app, ["sql-errors", "--config", str(cfg_path)])
     assert result.exit_code == 0
     assert "no SQL parse errors recorded" in result.output
+
+
+def test_query_command_reads_store_and_formats(tmp_path):
+    from lineage import db as dbmod
+
+    cfg_path = tmp_path / "config.yaml"
+    duckdb_path = tmp_path / "lineage.duckdb"
+    cfg_path.write_text(
+        "scratch_lib: QTEMP\nlibraries: [APPLIB]\n"
+        "output_seeds:\n  - id: X\n    library: APPLIB\n    file: OUT\n"
+        "storage:\n"
+        f"  duckdb: {duckdb_path}\n",
+        encoding="utf-8",
+    )
+    con = dbmod.connect(str(duckdb_path))
+    con.execute("INSERT INTO gaps VALUES ('parse_error', 'program:X', 'boom', '{}')")
+    con.close()
+
+    result = runner.invoke(app, [
+        "query", "SELECT kind, detail FROM gaps", "--config", str(cfg_path)])
+    assert result.exit_code == 0, result.output
+    assert "parse_error" in result.output and "boom" in result.output
+    assert "(1 row)" in result.output
+
+    result = runner.invoke(app, [
+        "query", "SELECT kind FROM gaps", "--config", str(cfg_path), "--csv"])
+    assert result.exit_code == 0
+    assert "kind" in result.output.splitlines()[0]
+
+
+def test_query_command_reads_jsonl_without_store(tmp_path):
+    import json as jsonmod
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        "scratch_lib: QTEMP\nlibraries: [APPLIB]\n"
+        "output_seeds:\n  - id: X\n    library: APPLIB\n    file: OUT\n"
+        "storage:\n"
+        f"  duckdb: {tmp_path / 'nonexistent.duckdb'}\n",
+        encoding="utf-8",
+    )
+    log = tmp_path / "calls.jsonl"
+    log.write_text(jsonmod.dumps(
+        {"ts": "2026-01-01T00:00:00", "kind": "sql", "ms": 5.0,
+         "tag": "catalog.systables", "ok": False, "text": "SELECT ...",
+         "error": "[SQL0206] boom"}) + "\n", encoding="utf-8")
+    result = runner.invoke(app, [
+        "query",
+        f"SELECT tag, error FROM read_json_auto('{log}') WHERE NOT ok",
+        "--config", str(cfg_path)])
+    assert result.exit_code == 0, result.output
+    assert "catalog.systables" in result.output
+    assert "[SQL0206] boom" in result.output
