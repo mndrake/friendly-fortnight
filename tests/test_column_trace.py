@@ -215,6 +215,96 @@ def test_trace_column_linear_on_dense_diamond_mesh():
     assert all(not b.startswith("(+") for b in bases)
 
 
+# --- default-view de-noising: collapse of structural relay hops ---------------
+
+def _mesh(*edges):
+    import networkx as nx
+
+    g = nx.MultiDiGraph()
+    for src, dst, conf in edges:
+        g.add_edge(src, dst, kind="derives_from", provenance="xref",
+                   confidence=conf, context={"mechanism": "same_name_field"})
+    return g
+
+
+def test_collapse_splices_relay_and_keeps_weakest_confidence():
+    """OUT.C1 <- OUT#.C1 <- BASE.C1: the hash-logical relay is spliced out;
+    the promoted BASE hop names the relay and carries the weaker confidence
+    of the two collapsed hops (requirements 1 and 5)."""
+    from lineage.analyze.column_trace import collapse_intermediates, trace_column
+
+    g = _mesh(("column:L/OUT.C1", "column:L/OUT#.C1", "inferred"),
+              ("column:L/OUT#.C1", "column:L/BASE.C1", "parsed"))
+    tree = collapse_intermediates(trace_column(g, "column:L/OUT.C1"),
+                                  {"L/OUT#"})
+    (child,) = tree.children
+    assert child.node == "column:L/BASE.C1"
+    assert child.context["collapsed_via"] == "L/OUT#.C1"
+    assert child.confidence == "inferred"
+    assert child.context["mechanism"] == "same_name_field"  # metadata kept
+
+
+def test_collapse_chains_via_through_stacked_relays():
+    """OUT <- A# <- B# <- BASE: both relays collapse, the via chain lists
+    them in traversal order."""
+    from lineage.analyze.column_trace import collapse_intermediates, trace_column
+
+    g = _mesh(("column:L/OUT.C", "column:L/A#.C", "inferred"),
+              ("column:L/A#.C", "column:L/B#.C", "inferred"),
+              ("column:L/B#.C", "column:L/BASE.C", "parsed"))
+    tree = collapse_intermediates(trace_column(g, "column:L/OUT.C"),
+                                  {"L/A#", "L/B#"})
+    (child,) = tree.children
+    assert child.node == "column:L/BASE.C"
+    assert child.context["collapsed_via"] == "L/A#.C, L/B#.C"
+
+
+def test_collapse_keeps_terminal_logical_source():
+    """A logical with no upstream of its own is the best-known source —
+    it must stay visible, not vanish (requirement 2)."""
+    from lineage.analyze.column_trace import collapse_intermediates, trace_column
+
+    g = _mesh(("column:L/OUT.C2", "column:L/LONE#.C2", "inferred"))
+    tree = collapse_intermediates(trace_column(g, "column:L/OUT.C2"),
+                                  {"L/LONE#"})
+    (child,) = tree.children
+    assert child.node == "column:L/LONE#.C2"
+
+
+def test_collapse_merges_duplicate_paths_and_drops_self_loop():
+    """OUT.C reaches A.C directly and again through relay X# (which also
+    loops back to OUT.C): the loop echo is dropped, the two A routes merge
+    into one node marked paths_merged, best confidence wins (req 4)."""
+    from lineage.analyze.column_trace import collapse_intermediates, trace_column
+
+    g = _mesh(("column:L/OUT.C", "column:L/A.C", "parsed"),
+              ("column:L/OUT.C", "column:L/X#.C", "inferred"),
+              ("column:L/X#.C", "column:L/A.C", "parsed"),
+              ("column:L/X#.C", "column:L/OUT.C", "inferred"))
+    tree = collapse_intermediates(trace_column(g, "column:L/OUT.C"),
+                                  {"L/X#"})
+    (child,) = tree.children
+    assert child.node == "column:L/A.C"
+    assert child.context["paths_merged"] == 2
+    assert child.confidence == "parsed"       # the direct route's confidence
+    assert not child.truncated
+
+
+def test_trace_table_collapses_by_default_raw_keeps_hops(built):
+    """Against the fixture estate: CUSTRPT.CUSTNO flows through the logical
+    CUSTLF1 — collapsed by default (CUSTMAST promoted, relay annotated),
+    fully expanded again with raw=True (requirement 3)."""
+    con, g = built
+    default = column_trace.trace_table(con, g, "APPLIB/CUSTRPT")
+    assert "column:APPLIB/CUSTMAST.CUSTNO" in default
+    assert "collapsed_via=APPLIB/CUSTLF1.CUSTNO" in default
+    assert "column:APPLIB/CUSTLF1.CUSTNO" not in default
+
+    raw = column_trace.trace_table(con, g, "APPLIB/CUSTRPT", raw=True)
+    assert "column:APPLIB/CUSTLF1.CUSTNO" in raw
+    assert "collapsed_via" not in raw
+
+
 def test_trace_column_caps_fan_in_with_stub():
     import networkx as nx
 

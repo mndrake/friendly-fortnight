@@ -31,7 +31,9 @@ from typing import Optional
 
 import networkx as nx
 
-from ..analyze.column_trace import (TargetColumn, TraceNode, resolve_target,
+from ..analyze.column_trace import (TargetColumn, TraceNode,
+                                    collapse_intermediates,
+                                    intermediate_specs, resolve_target,
                                     trace_column)
 from ..graph.model import column_id
 from ..graph.resolve import backward_lineage
@@ -77,7 +79,8 @@ _EDGE_DASH = {
 _NODE_FILL = {"file": "#e0f2fe", "program": "#ede9fe"}
 _NODE_STROKE = {"file": "#0369a1", "program": "#6d28d9"}
 
-_CTX_KEYS = ("mechanism", "program", "renamed_from", "via", "overridden_file")
+_CTX_KEYS = ("mechanism", "program", "renamed_from", "via", "overridden_file",
+             "collapsed_via", "paths_merged")
 
 
 def _esc(v) -> str:
@@ -662,9 +665,11 @@ def _render_hop(tn: TraceNode) -> str:
            f'<div class="hops">{inner}</div></details>')
 
 
-def _render_output_column(col_name: str, root: str, graph: nx.MultiDiGraph
-                          ) -> str:
+def _render_output_column(col_name: str, root: str, graph: nx.MultiDiGraph,
+                          intermediates: Optional[set[str]] = None) -> str:
     tree = trace_column(graph, root)
+    if intermediates:
+        tree = collapse_intermediates(tree, intermediates)
     file_spec = _file_spec_of(root)
     if not tree.children:
         return (
@@ -690,6 +695,15 @@ def _column_lineage_section(con, graph: nx.MultiDiGraph, seed) -> str:
 
     parts = [f'<h2 id="columns">Column lineage &mdash; {_esc(target.spec)}'
             f'</h2>']
+    intermediates = intermediate_specs(con)
+    if intermediates:
+        parts.append(
+            '<p class="note">Structural intermediates (logical files, '
+            'views) are collapsed out of these trees &mdash; '
+            '<code>collapsed_via</code> names the relay each hop passed '
+            'through, <code>paths_merged</code> counts duplicate routes '
+            'folded into one. The fully expanded walk: <code>lineage '
+            'trace-columns --table &hellip; --raw</code>.</p>')
     if not target.in_catalog:
         parts.append(
             '<p class="note">Table not found in the SQL catalog '
@@ -716,7 +730,8 @@ def _column_lineage_section(con, graph: nx.MultiDiGraph, seed) -> str:
                 break
         if root is None:
             root = column_id(target.library, target.name, col.sql_name)
-        parts.append(_render_output_column(col.sql_name, root, graph))
+        parts.append(_render_output_column(col.sql_name, root, graph,
+                                           intermediates))
     parts.append("</div>")
     return "\n".join(parts)
 

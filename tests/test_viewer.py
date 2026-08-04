@@ -70,18 +70,21 @@ def test_pages_are_self_contained_no_external_references(built, config,
         assert "https://" not in stripped
 
 
-def test_column_section_lists_column_with_nested_upstream_hop(built, config,
-                                                               tmp_path):
+def test_column_section_collapses_logical_relay_to_physical_source(built,
+                                                                    config,
+                                                                    tmp_path):
+    """Default column trees start at the first meaningful (non-logical)
+    source: the CUSTLF1 relay is collapsed into a collapsed_via annotation
+    on the promoted CUSTMAST hop, and the page says how to see the raw
+    expanded walk."""
     pages = _pages(built, config, tmp_path)
     text = pages["lineage_CUST_MONTHLY_RPT"].read_text(encoding="utf-8")
     assert 'class="columns"' in text
-    # CUSTNO -> CUSTLF1.CUSTNO (first hop) -> CUSTMAST.CUSTNO (nested hop).
-    assert "column:APPLIB/CUSTLF1.CUSTNO" in text
     assert "column:APPLIB/CUSTMAST.CUSTNO" in text
-    # Nesting: the CUSTMAST hop must appear inside CUSTLF1's <div class="hops">.
-    idx_custlf1 = text.index('data-file="APPLIB/CUSTLF1"')
-    idx_custmast = text.index("column:APPLIB/CUSTMAST.CUSTNO")
-    assert idx_custlf1 < idx_custmast
+    assert "collapsed_via=APPLIB/CUSTLF1.CUSTNO" in text
+    # The logical hop no longer appears as a tree node of its own.
+    assert "column:APPLIB/CUSTLF1.CUSTNO" not in text
+    assert "--raw" in text
 
 
 def test_unresolved_column_shows_no_resolved_lineage_marker(con, tmp_path):

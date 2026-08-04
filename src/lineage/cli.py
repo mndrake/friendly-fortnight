@@ -304,12 +304,18 @@ def trace_columns(config: str = _CONFIG_OPT,
                            "column lineage is traced from the built graph."),
                   out: Optional[str] = typer.Option(
                       None, help="Also write the rendered tree to this "
-                                 "file")) -> None:
+                                 "file"),
+                  raw: bool = typer.Option(
+                      False, "--raw",
+                      help="Show every hop, including logical-file/view "
+                           "relays that the default view collapses into "
+                           "collapsed_via annotations.")) -> None:
     """Trace column-level lineage of one selected output table as a tree.
 
     Reads the already-built graph, so run `build` (phase 3) first. The target's
     columns come from the SQL catalog (raw_syscolumns); each is traced backward
-    along column derives_from edges to its base-table columns.
+    along column derives_from edges to its base-table columns. Hops through
+    logical files and views are collapsed by default (--raw keeps them).
     """
     cfg = _load(config)
     con = _con(cfg)
@@ -321,7 +327,9 @@ def trace_columns(config: str = _CONFIG_OPT,
             target = column_trace.resolve_target(con, table)
         except ValueError as exc:
             raise typer.BadParameter(str(exc))
-        text = column_trace.render_forest(target, g)
+        text = column_trace.render_forest(
+            target, g,
+            intermediates=None if raw else column_trace.intermediate_specs(con))
         typer.echo(text)
         if out:
             out_path = Path(out)

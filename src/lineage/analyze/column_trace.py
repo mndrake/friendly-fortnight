@@ -247,6 +247,118 @@ def trace_column(graph: nx.MultiDiGraph, root: str,
     return tn
 
 
+# --- default-view de-noising: collapse structural relay hops ------------------
+
+def intermediate_specs(con) -> set[str]:
+    """File specs whose catalog type marks them as derived shapes.
+
+    On a DDS estate every physical file grows a fan of logical files (the
+    FUNDMASTER convention suffixes them ``#``), and same-name field
+    propagation makes each one a hop in the column trace: the first thing an
+    analyst sees under ``BROAST.ZBGN`` is ``BROAST#.ZBGN`` — the same
+    business entity, one access path removed. Those hops are structure, not
+    lineage. Anything in SYSTABLES that is not a base table (``T``/``P``) —
+    logicals, views, MQTs, aliases — counts as a structural intermediate;
+    both the SQL and system name forms are returned so specs match however
+    the node was minted.
+    """
+    out: set[str] = set()
+    for schema, name, sysname, ttype in con.execute(
+            "SELECT table_schema, table_name, system_name, table_type "
+            "FROM raw_systables").fetchall():
+        t = (str(ttype) if ttype is not None else "").strip().upper()
+        if not t or t in ("T", "P"):
+            continue
+        lib = (schema or "").strip().upper()
+        for nm in (name, sysname):
+            if nm:
+                out.add(f"{lib}/{str(nm).strip().upper()}")
+    return out
+
+
+def _col_file_spec(node: str) -> Optional[str]:
+    if not node.startswith("column:") or "." not in node:
+        return None
+    return node[len("column:"):].rsplit(".", 1)[0]
+
+
+def _conf_rank(conf: Optional[str]) -> int:
+    try:
+        return Confidence(conf).rank
+    except ValueError:
+        return -1
+
+
+def _conf_min(a: Optional[str], b: Optional[str]) -> Optional[str]:
+    if a is None:
+        return b
+    if b is None:
+        return a
+    try:
+        return min_confidence(Confidence(a), Confidence(b)).value
+    except ValueError:
+        return b
+
+
+def collapse_intermediates(tn: TraceNode, intermediates: set[str]
+                           ) -> TraceNode:
+    """Splice structural intermediates out of a trace tree, in place.
+
+    Default-view rules (the raw tree from ``trace_column`` is untouched —
+    callers wanting the full walk simply skip this pass):
+
+    * A child column living on an intermediate file (logical/view) that has
+      upstream of its own is replaced by that upstream; the relay is
+      recorded on each promoted node as ``collapsed_via`` (chained when
+      several relays are spliced in a row), and the promoted node's
+      confidence is the weakest of the collapsed hops, so an inferred
+      same-name relay still reads as inferred.
+    * A terminal intermediate (no upstream expansion) is kept — it *is* the
+      best-known source, and hiding it would fake resolution.
+    * Truncated stubs (cycle/limit markers) are never spliced.
+    * After splicing, duplicate children (the same column reached directly
+      and through a relay) merge into one node marked ``paths_merged``, and
+      a spliced child that circles back to its own parent is dropped — a
+      logical-self loop relays nothing.
+    """
+    spliced: list[TraceNode] = []
+    for child in tn.children:
+        collapse_intermediates(child, intermediates)
+        spec = _col_file_spec(child.node)
+        if (spec in intermediates and child.children
+                and not child.truncated):
+            hop = child.node[len("column:"):]
+            for gc in child.children:
+                prior = gc.context.get("collapsed_via")
+                gc.context["collapsed_via"] = (f"{hop}, {prior}" if prior
+                                               else hop)
+                gc.confidence = _conf_min(child.confidence, gc.confidence)
+                spliced.append(gc)
+        else:
+            spliced.append(child)
+
+    merged: dict[str, TraceNode] = {}
+    out: list[TraceNode] = []
+    for child in spliced:
+        if child.node == tn.node:
+            continue
+        prev = merged.get(child.node)
+        if prev is None:
+            merged[child.node] = child
+            out.append(child)
+            continue
+        keep, drop = prev, child
+        if ((bool(child.children), _conf_rank(child.confidence))
+                > (bool(prev.children), _conf_rank(prev.confidence))):
+            keep, drop = child, prev
+            out[out.index(prev)] = child
+            merged[child.node] = child
+        keep.context["paths_merged"] = (keep.context.get("paths_merged", 1)
+                                        + drop.context.get("paths_merged", 1))
+    tn.children = out
+    return tn
+
+
 def _collect_bases(tn: TraceNode, path_conf: Confidence,
                    is_root: bool = True) -> dict[str, Confidence]:
     """Base column node -> best (highest) per-path minimum confidence."""
@@ -269,7 +381,8 @@ def _collect_bases(tn: TraceNode, path_conf: Confidence,
 
 # --- rendering ---------------------------------------------------------------
 
-_CTX_KEYS = ("mechanism", "program", "renamed_from", "via", "overridden_file")
+_CTX_KEYS = ("mechanism", "program", "renamed_from", "via", "overridden_file",
+             "collapsed_via", "paths_merged")
 
 
 def _annotate(tn: TraceNode) -> str:
@@ -302,10 +415,20 @@ def _min_over(confs) -> Optional[Confidence]:
     return acc
 
 
-def render_forest(target: Target, graph: nx.MultiDiGraph) -> str:
-    """Render the full per-column upstream forest for the target table."""
+def render_forest(target: Target, graph: nx.MultiDiGraph,
+                  intermediates: Optional[set[str]] = None) -> str:
+    """Render the per-column upstream forest for the target table.
+
+    With ``intermediates`` given, structural relay hops (logical files,
+    views) are collapsed out of each tree — the default analyst view; pass
+    ``None`` for the raw fully-expanded walk.
+    """
     header = f"Column-level lineage: {target.spec}"
     lines = [header, "=" * len(header)]
+    if intermediates:
+        lines.append("(structural intermediates — logical files, views — "
+                     "collapsed; collapsed_via names the relay. "
+                     "Use --raw for the fully expanded tree.)")
 
     if not target.in_catalog:
         lines.append(
@@ -343,6 +466,8 @@ def render_forest(target: Target, graph: nx.MultiDiGraph) -> str:
             root = column_id(target.library, target.name, col.sql_name)
 
         tree = trace_column(graph, root)
+        if intermediates:
+            tree = collapse_intermediates(tree, intermediates)
         bases = _collect_bases(tree, Confidence.CONFIRMED)
 
         lines.append("")
@@ -359,7 +484,13 @@ def render_forest(target: Target, graph: nx.MultiDiGraph) -> str:
     return "\n".join(lines) + "\n"
 
 
-def trace_table(con, graph: nx.MultiDiGraph, table_arg: str) -> str:
-    """Resolve ``table_arg`` and render its column-lineage forest."""
+def trace_table(con, graph: nx.MultiDiGraph, table_arg: str,
+                raw: bool = False) -> str:
+    """Resolve ``table_arg`` and render its column-lineage forest.
+
+    Default view collapses structural intermediates (see
+    ``collapse_intermediates``); ``raw=True`` keeps every hop.
+    """
     target = resolve_target(con, table_arg)
-    return render_forest(target, graph)
+    inter = None if raw else intermediate_specs(con)
+    return render_forest(target, graph, intermediates=inter)
