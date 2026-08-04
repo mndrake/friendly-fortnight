@@ -276,6 +276,17 @@ def intermediate_specs(con) -> set[str]:
     return out
 
 
+def untraced_notes(con) -> dict[str, str]:
+    """Column node id -> why the build could not trace it (gap detail)."""
+    out: dict[str, str] = {}
+    for obj, detail in con.execute(
+            "SELECT object_id, detail FROM gaps WHERE kind IN "
+            "('rpg_untraced_output_field', 'ospec_field_unmapped')"
+            ).fetchall():
+        out.setdefault(str(obj), str(detail))
+    return out
+
+
 def _col_file_spec(node: str) -> Optional[str]:
     if not node.startswith("column:") or "." not in node:
         return None
@@ -382,7 +393,7 @@ def _collect_bases(tn: TraceNode, path_conf: Confidence,
 # --- rendering ---------------------------------------------------------------
 
 _CTX_KEYS = ("mechanism", "program", "renamed_from", "via", "overridden_file",
-             "collapsed_via", "paths_merged")
+             "collapsed_via", "paths_merged", "ambiguous_files", "same_base")
 
 
 def _annotate(tn: TraceNode) -> str:
@@ -416,7 +427,8 @@ def _min_over(confs) -> Optional[Confidence]:
 
 
 def render_forest(target: Target, graph: nx.MultiDiGraph,
-                  intermediates: Optional[set[str]] = None) -> str:
+                  intermediates: Optional[set[str]] = None,
+                  unresolved_notes: Optional[dict[str, str]] = None) -> str:
     """Render the per-column upstream forest for the target table.
 
     With ``intermediates`` given, structural relay hops (logical files,
@@ -472,7 +484,9 @@ def render_forest(target: Target, graph: nx.MultiDiGraph,
 
         lines.append("")
         if not bases:
-            lines.append(f"{col.sql_name}  → no resolved lineage")
+            note = (unresolved_notes or {}).get(root)
+            lines.append(f"{col.sql_name}  → no resolved lineage"
+                         + (f"  ({note})" if note else ""))
             continue
         overall = _min_over(bases.values())
         n = len(bases)
@@ -493,4 +507,5 @@ def trace_table(con, graph: nx.MultiDiGraph, table_arg: str,
     """
     target = resolve_target(con, table_arg)
     inter = None if raw else intermediate_specs(con)
-    return render_forest(target, graph, intermediates=inter)
+    return render_forest(target, graph, intermediates=inter,
+                         unresolved_notes=untraced_notes(con))

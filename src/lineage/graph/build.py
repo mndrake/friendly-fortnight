@@ -30,11 +30,19 @@ def _col_file_spec(col_node: str) -> str:
     return body.rsplit(".", 1)[0]
 
 
+#: RPG special words that resolve at run time, not from any file — a field
+#: assigned from these is a runtime value (extract date/time stamps), and
+#: "no resolved lineage" is the CORRECT answer, worth explaining.
+_RPG_RUNTIME_VALUES = {"UDATE", "UDAY", "UMONTH", "UYEAR", "UDATE0",
+                       "TIME", "TIMDAT"}
+
+
 class GraphBuilder:
     def __init__(self, con, config, phase: int = 3):
         self.con = con
         self.config = config
         self.phase = phase
+        self._dbr_base: dict[tuple[str, str], tuple[str, str]] = {}
         self.nodes: dict[str, Node] = {}
         self.edges: list[Edge] = []
         self._edge_keys: set = set()
@@ -367,15 +375,18 @@ class GraphBuilder:
         file-level dependency and the catalog knows both field sets, and a
         non-join logical exposes its base file's fields under the same
         names — so same-named columns pass through at inferred confidence.
-        Files that already have parsed evidence (DDS field maps, view
-        definitions) are skipped: parsed beats synthesized.
+        Columns that already have parsed evidence (DDS field maps, view
+        definitions) are skipped — parsed beats synthesized — but the gate
+        is per COLUMN, not per file: a partially parsed DDS (some fields
+        renamed/REFed, others missed) must not leave the unparsed fields
+        stranded at the logical as if it were a base file.
         """
-        # File specs that already carry column-derives evidence from their
-        # own definition — don't second-guess them.
-        has_parsed: set[str] = set()
+        # Column node ids that already carry derives evidence from their
+        # own definition — don't second-guess those specific columns.
+        has_parsed_col: set[str] = set()
         for e in self.edges:
             if e.kind == EdgeKind.DERIVES_FROM and e.src.startswith("column:"):
-                has_parsed.add(_col_file_spec(e.src))
+                has_parsed_col.add(e.src)
 
         ffd = self._dspffd_fields()
         for dlib, dfile, blib, bfile in self.con.execute(
@@ -388,14 +399,15 @@ class GraphBuilder:
             if dep_id == base_id:
                 continue
             dep_spec = dep_id.split(":", 1)[1]
-            if dep_spec in has_parsed:
-                continue
             dkey = tuple(dep_spec.split("/", 1))
             bkey = tuple(base_id.split(":", 1)[1].split("/", 1))
             common = ffd.get(dkey, set()) & ffd.get(bkey, set())
             for f in sorted(common):
+                src = self._col_id(dkey[0], dkey[1], f)
+                if src in has_parsed_col:
+                    continue
                 self.add_edge(Edge(
-                    src=self._col_id(dkey[0], dkey[1], f),
+                    src=src,
                     dst=self._col_id(bkey[0], bkey[1], f),
                     kind=EdgeKind.DERIVES_FROM,
                     provenance=Provenance.XREF,
@@ -927,8 +939,11 @@ class GraphBuilder:
           I-spec fields instead of catalog columns.
 
         Confidence: ``parsed`` when the source field lives in exactly one
-        read file, ``inferred`` (with ``ambiguous_files``) when several
-        read files carry it — the honest residue of static analysis.
+        read file — or in several files that DSPDBR proves are views of one
+        base physical (reading a logical and its base is ONE source, marked
+        ``same_base``); ``inferred`` (with ``ambiguous_files``) only when
+        genuinely distinct base files carry it — the honest residue of
+        static analysis.
         """
         prog_described: dict[str, set[str]] = defaultdict(set)
         rpg_programs: set[str] = set()
@@ -969,6 +984,19 @@ class GraphBuilder:
                 d.add(str(src).upper())
 
         ffd = self._dspffd_fields()
+
+        # LF -> base-PF map from DSPDBR, for ambiguity collapse: a field
+        # found in two read files that are views of the same physical is
+        # one source, not two.
+        dbr_base: dict[tuple[str, str], tuple[str, str]] = {}
+        for dlib, dfile, blib, bfile in self.con.execute(
+                "SELECT DISTINCT dep_lib, dep_file, based_lib, based_file "
+                "FROM raw_dspdbr").fetchall():
+            if dlib and dfile and blib and bfile:
+                dbr_base[(str(dlib).strip().upper(),
+                          str(dfile).strip().upper())] = \
+                    (str(blib).strip().upper(), str(bfile).strip().upper())
+        self._dbr_base = dbr_base
 
         # program -> read/write file node ids, from edges built so far
         # (override-resolved). Program-described files stay in — the O-spec
@@ -1056,16 +1084,22 @@ class GraphBuilder:
         chain: walk source fields until one belongs to a read file, carrying
         the intermediate variables as ``via``. An unassigned field resolves
         by direct record read-through. Both attribute per terminal field:
-        one owning read file = parsed, several = inferred + ambiguous_files.
+        one owning base file = parsed (read files that DSPDBR maps to the
+        same physical count as one, marked ``same_base``), several distinct
+        bases = inferred + ambiguous_files. Untraceable fields leave a gap
+        that says WHY (runtime value, literals, dead-end work variables) so
+        "no resolved lineage" is explained, not bare.
         """
         collected: list[tuple[str, tuple[str, ...],
                               list[tuple[str, str]]]] = []
+        dead_ends: set[str] = set()
 
         def owners(tok: str) -> list[tuple[str, str]]:
             return [rkey for rkey, rfields in read_specs
                     if tok in rfields and rkey != wkey]
 
-        if f in pmoves:
+        assigned = f in pmoves
+        if assigned:
             seen = {f}
             stack: list[tuple[str, tuple[str, ...]]] = [(f, ())]
             while stack:
@@ -1075,7 +1109,11 @@ class GraphBuilder:
                     if hits:
                         collected.append((tok, path, hits))
                         continue  # reached a file-backed field: stop here
-                for s in sorted(pmoves.get(tok, ())):
+                srcs = pmoves.get(tok)
+                if srcs is None and tok != f:
+                    dead_ends.add(tok)
+                    continue
+                for s in sorted(srcs or ()):
                     if s not in seen and len(path) < 8:
                         seen.add(s)
                         stack.append((s, path + (tok,)))
@@ -1085,18 +1123,43 @@ class GraphBuilder:
                 collected.append((f, (), hits))
 
         if not collected:
-            if gap_when_untraced:
+            if assigned or gap_when_untraced:
+                runtime = sorted(dead_ends & _RPG_RUNTIME_VALUES)
+                work = sorted(dead_ends - _RPG_RUNTIME_VALUES)
+                if runtime:
+                    reason, detail = "runtime_value", (
+                        "assigned from runtime value(s) "
+                        + ", ".join(runtime))
+                elif work:
+                    reason, detail = "work_variables", (
+                        "assignment chain dead-ends at work variable(s) "
+                        + ", ".join(work[:6]))
+                elif assigned:
+                    reason, detail = "constant", (
+                        "assigned but no field source (literals, constants, "
+                        "or runtime opcodes like TIME)")
+                else:
+                    reason, detail = "unowned", \
+                        "not assigned and not present in any read file"
                 self.gap(
                     "rpg_untraced_output_field",
                     self._col_id(wkey[0], wkey[1], f),
-                    f"{pname} writes {f} but no source field reaches a read "
-                    "file (constant-fed, or computed from non-file "
-                    "variables)",
-                    {"program": pname})
+                    f"{pname} writes {f}: {detail}",
+                    {"program": pname, "reason": reason})
             return
 
+        def ultimate_base(key: tuple[str, str]) -> tuple[str, str]:
+            k = key
+            for _ in range(4):
+                nxt = self._dbr_base.get(k)
+                if nxt is None or nxt == k:
+                    break
+                k = nxt
+            return k
+
         for tok, path, hits in collected:
-            conf = (Confidence.PARSED if len(hits) == 1
+            bases = {ultimate_base(k) for k in hits}
+            conf = (Confidence.PARSED if len(bases) == 1
                     else Confidence.INFERRED)
             ctx_base = {"program": pname,
                         "mechanism": ("cspec_move_chain" if path
@@ -1104,8 +1167,10 @@ class GraphBuilder:
             via = path[1:]
             if via:
                 ctx_base["via"] = " <- ".join(via)
-            if len(hits) > 1:
+            if len(bases) > 1:
                 ctx_base["ambiguous_files"] = len(hits)
+            elif len(hits) > 1:
+                ctx_base["same_base"] = "/".join(next(iter(bases)))
             for rkey in hits:
                 self.add_edge(Edge(
                     src=self._col_id(wkey[0], wkey[1], f),

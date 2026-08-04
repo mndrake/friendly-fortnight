@@ -421,3 +421,158 @@ def test_unique_read_through_promoted_ambiguous_stays_inferred():
         assert d["confidence"] == "inferred"
         assert d["context"]["ambiguous_files"] == 2
     con.close()
+
+
+def test_lf_passthrough_gate_is_per_column():
+    """A partially parsed DDS (rename evidence for one field) must not
+    suppress passthrough for the OTHER fields — they'd strand at the
+    logical as if it were a base file (live ASSET# case)."""
+    import json as jsonmod
+
+    from lineage import db as dbmod
+    from lineage.config import from_dict
+    from lineage.db import insert_rows
+    from lineage.graph.build import build_graph
+
+    con = dbmod.connect(None)
+    cols = []
+    for tbl in ("BASEPF", "PARTLF"):
+        for i, c in enumerate(("CNAME", "QCONSC")):
+            cols.append(("DTAL", tbl, tbl, c, c, i + 1, "CHAR", 8, None,
+                         "N", "x"))
+    insert_rows(con, "raw_syscolumns",
+                ["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal", "data_type", "length",
+                 "numeric_scale", "is_nullable", "column_heading"], cols)
+    insert_rows(con, "raw_dspdbr",
+                ["dep_lib", "dep_file", "based_lib", "based_file",
+                 "dep_type"],
+                [("DTAL", "PARTLF", "DTAL", "BASEPF", "D")])
+    insert_rows(con, "parsed_dds_files",
+                ["library", "file", "dds_type", "record_format", "based_on",
+                 "is_join"],
+                [("DTAL", "PARTLF", "LF", "PARTLFR",
+                  jsonmod.dumps(["BASEPF"]), False)])
+    # Parsed DDS evidence exists for CNAME only.
+    insert_rows(con, "parsed_dds_fields",
+                ["library", "file", "record_format", "field_name",
+                 "renamed_from", "ref_field", "ref_file", "concat_fields",
+                 "usage"],
+                [("DTAL", "PARTLF", "PARTLFR", "CNAME", "CUSTNAME",
+                  "CUSTNAME", "BASEPF", None, "B")])
+    config = from_dict({
+        "scratch_lib": "QTEMP", "libraries": ["DTAL"],
+        "output_seeds": [{"id": "X", "library": "DTAL", "file": "PARTLF"}],
+        "liblists": {"default": ["DTAL"]},
+    })
+    g = build_graph(con, config, phase=3)
+    passthrough = {(u, v) for u, v, d in g.edges(data=True)
+                   if d.get("kind") == "derives_from"
+                   and d.get("context", {}).get("mechanism")
+                   == "lf_field_passthrough"}
+    # The unparsed column bridges to the base...
+    assert ("column:DTAL/PARTLF.QCONSC",
+            "column:DTAL/BASEPF.QCONSC") in passthrough
+    # ...while the parsed-DDS column is left to its parsed evidence.
+    assert ("column:DTAL/PARTLF.CNAME",
+            "column:DTAL/BASEPF.CNAME") not in passthrough
+    con.close()
+
+
+def test_same_base_read_files_resolve_parsed():
+    """A field found in two read files that DSPDBR proves are views of one
+    physical (LF + its base) is ONE source: parsed, marked same_base — not
+    a fake ambiguity."""
+    from lineage import db as dbmod
+    from lineage.config import from_dict
+    from lineage.db import insert_rows
+    from lineage.graph.build import build_graph
+
+    con = dbmod.connect(None)
+    cols = []
+    for tbl in ("OUTF", "BASEPF", "BASELF"):
+        cols.append(("APPX", tbl, tbl, "AMT", "AMT", 1, "CHAR", 10, None,
+                     "N", "x"))
+    insert_rows(con, "raw_syscolumns",
+                ["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal", "data_type", "length",
+                 "numeric_scale", "is_nullable", "column_heading"], cols)
+    insert_rows(con, "raw_dspdbr",
+                ["dep_lib", "dep_file", "based_lib", "based_file",
+                 "dep_type"],
+                [("APPX", "BASELF", "APPX", "BASEPF", "D")])
+    insert_rows(con, "raw_dsppgmref",
+                ["program_lib", "program_name", "object_lib", "object_name",
+                 "object_type", "usage_flag", "ref_count"],
+                [("APPX", "RPGM2", "APPX", "BASEPF", "F", "1", 1),
+                 ("APPX", "RPGM2", "APPX", "BASELF", "F", "1", 1),
+                 ("APPX", "RPGM2", "APPX", "OUTF", "F", "2", 1)])
+    insert_rows(con, "parsed_rpg_files",
+                ["program", "file", "usage", "extname", "rename_rec",
+                 "declared_via", "program_described"],
+                [("APPX/RPGM2", "BASEPF", "input", None, None, "fspec", False),
+                 ("APPX/RPGM2", "BASELF", "input", None, None, "fspec", False),
+                 ("APPX/RPGM2", "OUTF", "output", None, None, "fspec", False)])
+    config = from_dict({
+        "scratch_lib": "QTEMP", "libraries": ["APPX"],
+        "output_seeds": [{"id": "O", "library": "APPX", "file": "OUTF"}],
+        "liblists": {"default": ["APPX"]},
+    })
+    g = build_graph(con, config, phase=3)
+    derives = {(u, v): d for u, v, d in g.edges(data=True)
+               if d.get("kind") == "derives_from"
+               and u == "column:APPX/OUTF.AMT"}
+    assert len(derives) == 2                     # both routes shown...
+    for d in derives.values():                   # ...but as ONE source
+        assert d["confidence"] == "parsed"
+        assert d["context"]["same_base"] == "APPX/BASEPF"
+        assert "ambiguous_files" not in d["context"]
+    con.close()
+
+
+def test_untraced_output_field_gaps_explain_why():
+    """Constant-fed, runtime-value, and dead-end-work-variable fields each
+    leave a gap that says WHY there is no lineage."""
+    from lineage import db as dbmod
+    from lineage.config import from_dict
+    from lineage.db import insert_rows
+    from lineage.graph.build import build_graph
+
+    con = dbmod.connect(None)
+    cols = []
+    for tbl, names in (("OUTF", ("CNT", "RUNYR", "DEAD")), ("INF", ("F1",))):
+        for i, c in enumerate(names):
+            cols.append(("APPX", tbl, tbl, c, c, i + 1, "CHAR", 10, None,
+                         "N", "x"))
+    insert_rows(con, "raw_syscolumns",
+                ["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal", "data_type", "length",
+                 "numeric_scale", "is_nullable", "column_heading"], cols)
+    insert_rows(con, "raw_dsppgmref",
+                ["program_lib", "program_name", "object_lib", "object_name",
+                 "object_type", "usage_flag", "ref_count"],
+                [("APPX", "GPGM", "APPX", "INF", "F", "1", 1),
+                 ("APPX", "GPGM", "APPX", "OUTF", "F", "2", 1)])
+    insert_rows(con, "parsed_rpg_files",
+                ["program", "file", "usage", "extname", "rename_rec",
+                 "declared_via", "program_described"],
+                [("APPX/GPGM", "INF", "input", None, None, "fspec", False),
+                 ("APPX/GPGM", "OUTF", "output", None, None, "fspec", False)])
+    insert_rows(con, "parsed_rpg_moves",
+                ["program", "seq", "opcode", "source_field", "result_field"],
+                [("APPX/GPGM", 1, "Z-ADD", None, "CNT"),        # constant
+                 ("APPX/GPGM", 2, "MOVE", "UYEAR", "RUNYR"),    # runtime
+                 ("APPX/GPGM", 3, "MOVE", "WORKVAR", "DEAD")])  # dead-end
+    config = from_dict({
+        "scratch_lib": "QTEMP", "libraries": ["APPX"],
+        "output_seeds": [{"id": "O", "library": "APPX", "file": "OUTF"}],
+        "liblists": {"default": ["APPX"]},
+    })
+    build_graph(con, config, phase=3)
+    gaps = {obj: (json_ctx, detail) for obj, detail, json_ctx in con.execute(
+        "SELECT object_id, detail, context FROM gaps "
+        "WHERE kind = 'rpg_untraced_output_field'").fetchall()}
+    assert "runtime value(s) UYEAR" in gaps["column:APPX/OUTF.RUNYR"][1]
+    assert "work variable(s) WORKVAR" in gaps["column:APPX/OUTF.DEAD"][1]
+    assert "no field source" in gaps["column:APPX/OUTF.CNT"][1]
+    con.close()

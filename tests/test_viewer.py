@@ -297,3 +297,49 @@ def test_physical_flow_falls_back_when_seed_has_no_evidence():
     assert stats["evidence_applied"] is False
     assert {f"file:{LIB}/FEEDER", f"file:{LIB}/REFONLY"} <= set(out_nodes)
     assert len(out_edges) == 2
+
+
+def test_unresolved_column_shows_reason_from_gaps():
+    """A column the RPG build deliberately declined to trace shows WHY next
+    to the unresolved marker (runtime value / constant-fed / dead-end)."""
+    from lineage import db as dbmod
+    from lineage.db import insert_rows
+    from lineage.graph.build import build_graph
+
+    con = dbmod.connect(None)
+    cols = []
+    for tbl, names in (("OUTF", ("RUNYR",)), ("INF", ("F1",))):
+        for i, c in enumerate(names):
+            cols.append((LIB, tbl, tbl, c, c, i + 1, "CHAR", 10, None,
+                         "N", "x"))
+    insert_rows(con, "raw_syscolumns",
+                ["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal", "data_type", "length",
+                 "numeric_scale", "is_nullable", "column_heading"], cols)
+    insert_rows(con, "raw_dsppgmref",
+                ["program_lib", "program_name", "object_lib", "object_name",
+                 "object_type", "usage_flag", "ref_count"],
+                [(LIB, "GPGM", LIB, "INF", "F", "1", 1),
+                 (LIB, "GPGM", LIB, "OUTF", "F", "2", 1)])
+    insert_rows(con, "parsed_rpg_files",
+                ["program", "file", "usage", "extname", "rename_rec",
+                 "declared_via", "program_described"],
+                [(f"{LIB}/GPGM", "INF", "input", None, None, "fspec", False),
+                 (f"{LIB}/GPGM", "OUTF", "output", None, None, "fspec",
+                  False)])
+    insert_rows(con, "parsed_rpg_moves",
+                ["program", "seq", "opcode", "source_field", "result_field"],
+                [(f"{LIB}/GPGM", 1, "MOVE", "UYEAR", "RUNYR")])
+    cfg = from_dict({
+        "scratch_lib": "QTEMP", "libraries": [LIB],
+        "source_files": [{"library": LIB, "file": "QRPGSRC"}],
+        "output_seeds": [{"id": "OUT_X", "library": LIB, "file": "OUTF"}],
+        "liblists": {"default": [LIB]},
+    })
+    g = build_graph(con, cfg, phase=3)
+    written = viewer.render_output_pages(con, g, cfg, __import__("tempfile")
+                                         .mkdtemp())
+    text = written[0].read_text(encoding="utf-8")
+    assert "no resolved lineage" in text
+    assert "runtime value(s) UYEAR" in text
+    con.close()

@@ -80,7 +80,7 @@ _NODE_FILL = {"file": "#e0f2fe", "program": "#ede9fe"}
 _NODE_STROKE = {"file": "#0369a1", "program": "#6d28d9"}
 
 _CTX_KEYS = ("mechanism", "program", "renamed_from", "via", "overridden_file",
-             "collapsed_via", "paths_merged")
+             "collapsed_via", "paths_merged", "ambiguous_files", "same_base")
 
 
 def _esc(v) -> str:
@@ -666,17 +666,22 @@ def _render_hop(tn: TraceNode) -> str:
 
 
 def _render_output_column(col_name: str, root: str, graph: nx.MultiDiGraph,
-                          intermediates: Optional[set[str]] = None) -> str:
+                          intermediates: Optional[set[str]] = None,
+                          unresolved_notes: Optional[dict[str, str]] = None
+                          ) -> str:
     tree = trace_column(graph, root)
     if intermediates:
         tree = collapse_intermediates(tree, intermediates)
     file_spec = _file_spec_of(root)
     if not tree.children:
+        note = (unresolved_notes or {}).get(root)
+        note_txt = (f' <span class="ctx">&mdash; {_esc(note)}</span>'
+                    if note else "")
         return (
             f'<details class="column">'
             f'<summary><b data-file="{_attr(file_spec)}">{_esc(col_name)}'
             f'</b> <span class="marker-unresolved">no resolved lineage'
-            f'</span></summary></details>')
+            f'</span>{note_txt}</summary></details>')
     inner = "".join(_render_hop(c) for c in tree.children)
     return (
         f'<details class="column" open>'
@@ -696,6 +701,14 @@ def _column_lineage_section(con, graph: nx.MultiDiGraph, seed) -> str:
     parts = [f'<h2 id="columns">Column lineage &mdash; {_esc(target.spec)}'
             f'</h2>']
     intermediates = intermediate_specs(con)
+    # WHY a column has no lineage, when the build recorded it: constant-fed,
+    # runtime value, dead-end work variables, unmapped O-spec field.
+    unresolved_notes: dict[str, str] = {}
+    for obj, detail in con.execute(
+            "SELECT object_id, detail FROM gaps WHERE kind IN "
+            "('rpg_untraced_output_field', 'ospec_field_unmapped')"
+            ).fetchall():
+        unresolved_notes.setdefault(str(obj), str(detail))
     if intermediates:
         parts.append(
             '<p class="note">Structural intermediates (logical files, '
@@ -731,7 +744,7 @@ def _column_lineage_section(con, graph: nx.MultiDiGraph, seed) -> str:
         if root is None:
             root = column_id(target.library, target.name, col.sql_name)
         parts.append(_render_output_column(col.sql_name, root, graph,
-                                           intermediates))
+                                           intermediates, unresolved_notes))
     parts.append("</div>")
     return "\n".join(parts)
 

@@ -61,6 +61,23 @@ def diagnose_table(con, table_arg: str, limit: int = 12) -> list[str]:
                 [nid, limit]).fetchall():
             lines.append(f"    <- writes: {src} ({prov}, {conf})")
 
+    _section(lines, "DSPDBR relationships / DDS parse")
+    ph = ", ".join("?" * len(names))
+    drows = con.execute(
+        f"SELECT dep_lib, dep_file, based_lib, based_file FROM raw_dspdbr "
+        f"WHERE upper(trim(dep_file)) IN ({ph}) "
+        f"OR upper(trim(based_file)) IN ({ph})",
+        sorted(names) + sorted(names)).fetchall()
+    if not drows:
+        lines.append("  (no DSPDBR rows mention this table — logical/base "
+                     "links unknown to the passthrough)")
+    for dl, df, bl, bf in drows[:limit]:
+        lines.append(f"  {dl}/{df} is based on {bl}/{bf}")
+    (n_dds,) = con.execute(
+        f"SELECT count(*) FROM parsed_dds_fields "
+        f"WHERE upper(trim(file)) IN ({ph})", sorted(names)).fetchone()
+    lines.append(f"  parsed DDS field rows for these names: {n_dds}")
+
     _section(lines, "parsed SQL statements mentioning the table")
     conds = " OR ".join(["upper(raw_sql) LIKE ?"] * len(names))
     params = [f"%{nm}%" for nm in sorted(names)]

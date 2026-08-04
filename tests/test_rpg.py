@@ -303,3 +303,14 @@ def test_parse_all_persists_field_level_rows(parsed):
         "WHERE program = 'APPLIB/PGMDESC' AND result_field = 'OFLD1'"
     ).fetchall()
     assert moves == [("WFLD1", "OFLD1")]
+
+
+def test_time_and_clear_record_assignment_without_source():
+    p = _parse3(
+        "     FORDERS  IF  E                  DISK\n"
+        + _fixed({5: "C", 27: "TIME", 42: "TSTAMP"}) + "\n"
+        + _fixed({5: "C", 27: "CLEAR", 42: "WTOTAL"}) + "\n"
+    )
+    moves = [(m.opcode, m.source, m.result) for m in p.moves]
+    assert ("TIME", None, "TSTAMP") in moves
+    assert ("CLEAR", None, "WTOTAL") in moves

@@ -329,7 +329,8 @@ def trace_columns(config: str = _CONFIG_OPT,
             raise typer.BadParameter(str(exc))
         text = column_trace.render_forest(
             target, g,
-            intermediates=None if raw else column_trace.intermediate_specs(con))
+            intermediates=None if raw else column_trace.intermediate_specs(con),
+            unresolved_notes=column_trace.untraced_notes(con))
         typer.echo(text)
         if out:
             out_path = Path(out)

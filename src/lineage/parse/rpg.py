@@ -229,7 +229,8 @@ _MOVE_SOURCE_FACTORS: dict[str, tuple[int, ...]] = {
     "XLATE": (2,), "SUBST": (2,),
     "ADD": (1, 2), "SUB": (1, 2), "MULT": (1, 2), "DIV": (1, 2),
     "CAT": (1, 2),
-    "MVR": (),
+    # Assigned, but from no file field: DIV remainder, system clock, reset.
+    "MVR": (), "TIME": (), "CLEAR": (),
 }
 
 
