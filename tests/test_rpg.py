@@ -227,3 +227,79 @@ def test_parse_all_fixture_estate(parsed):
     blocks = parsed.execute(
         "SELECT program, raw_sql FROM _rpg_sql_blocks").fetchall()
     assert any("INSERT INTO ORDEXT" in sql for _, sql in blocks)
+
+
+# --- O-spec / I-spec / C-spec move extraction (definitive field lineage) ------
+
+def _fixed(col_chars: dict[int, str]) -> str:
+    """Build a fixed-format line by exact column index."""
+    n = max(col_chars) + 1
+    chars = [" "] * n
+    for i, c in col_chars.items():
+        for j, ch in enumerate(c):
+            if i + j >= len(chars):
+                chars.extend(" " * (i + j - len(chars) + 1))
+            chars[i + j] = ch
+    return "".join(chars)
+
+
+def test_ospec_fields_extracted_with_end_positions():
+    p = _parse3(
+        "     FLEGOUT  O   F     132          DISK\n"
+        + _fixed({5: "O", 6: "LEGOUT", 14: "E", 31: "OUT1"}) + "\n"   # record
+        + _fixed({5: "O", 31: "OFLD1", 41: "6"}) + "\n"
+        + _fixed({5: "O", 31: "OFLD2", 40: "36"}) + "\n"
+        + _fixed({5: "O", 31: "PAGE", 41: "4"}) + "\n"                # special
+        + _fixed({5: "O", 31: "UDATE", 40: "44"}) + "\n"              # special
+    )
+    entries = [(o.file, o.field, o.end_pos) for o in p.ospec_fields]
+    assert entries == [("LEGOUT", "OFLD1", 6), ("LEGOUT", "OFLD2", 36)]
+    # The EXCPT name on the record line is not a field.
+    assert not any(o.field == "OUT1" for o in p.ospec_fields)
+
+
+def test_ispec_fields_extracted_with_positions():
+    p = _parse3(
+        "     FLEGACY  IF  F     132          DISK\n"
+        + _fixed({5: "I", 6: "LEGACY", 14: "AA", 18: "01"}) + "\n"
+        + _fixed({5: "I", 46: "1", 49: "6", 51: "0", 52: "FLD1"}) + "\n"
+        + _fixed({5: "I", 46: "7", 48: "36", 52: "FLD2"}) + "\n"
+    )
+    entries = [(f.file, f.field, f.from_pos, f.to_pos) for f in p.ispec_fields]
+    assert entries == [("LEGACY", "FLD1", 1, 6), ("LEGACY", "FLD2", 7, 36)]
+
+
+def test_cspec_moves_field_sources_and_constants():
+    p = _parse3(
+        "     FORDERS  IF  E                  DISK\n"
+        + _fixed({5: "C", 27: "MOVE", 32: "FLD1", 42: "WFLD1"}) + "\n"
+        + _fixed({5: "C", 17: "AMT1", 27: "ADD", 32: "AMT2", 42: "TOTAL"}) + "\n"
+        + _fixed({5: "C", 27: "Z-ADD", 32: "0", 42: "COUNT"}) + "\n"      # literal
+        + _fixed({5: "C", 27: "MOVEL", 32: "'AB'", 42: "CODE"}) + "\n"    # literal
+        + _fixed({5: "C", 27: "MOVE", 32: "ARR,3", 42: "OUT1"}) + "\n"    # index
+    )
+    moves = [(m.opcode, m.source, m.result) for m in p.moves]
+    assert ("MOVE", "FLD1", "WFLD1") in moves
+    # ADD contributes both factors as sources.
+    assert ("ADD", "AMT1", "TOTAL") in moves and ("ADD", "AMT2", "TOTAL") in moves
+    # Literal assignments keep a source=None row: assigned, no field source.
+    assert ("Z-ADD", None, "COUNT") in moves
+    assert ("MOVEL", None, "CODE") in moves
+    # Array index reduces to the array name.
+    assert ("MOVE", "ARR", "OUT1") in moves
+
+
+def test_parse_all_persists_field_level_rows(parsed):
+    ospec = parsed.execute(
+        "SELECT file, field_name, end_pos FROM parsed_rpg_ospec_fields "
+        "WHERE program = 'APPLIB/PGMDESC' ORDER BY end_pos").fetchall()
+    assert ospec == [("LEGOUT", "OFLD1", 6), ("LEGOUT", "OFLD2", 36)]
+    ispec = parsed.execute(
+        "SELECT file, field_name FROM parsed_rpg_ispec_fields "
+        "WHERE program = 'APPLIB/PGMDESC' ORDER BY field_name").fetchall()
+    assert ispec == [("LEGACY", "FLD1"), ("LEGACY", "FLD2")]
+    moves = parsed.execute(
+        "SELECT source_field, result_field FROM parsed_rpg_moves "
+        "WHERE program = 'APPLIB/PGMDESC' AND result_field = 'OFLD1'"
+    ).fetchall()
+    assert moves == [("WFLD1", "OFLD1")]

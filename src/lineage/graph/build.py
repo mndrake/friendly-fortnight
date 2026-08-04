@@ -903,22 +903,33 @@ class GraphBuilder:
     # -- record-format column expansion --------------------------------------
 
     def _record_format_column_expansion(self) -> None:
-        """Same-named fields between a written file and the read files map
-        column-to-column (confidence=inferred) — the classic RPG III
-        externally-described move-corresponding pattern; honest as
-        'inferred', never 'parsed'.
+        """Field-level source resolution for RPG record I/O.
 
-        Gating is per *file*, not per program classification: a single
-        program-described work/printer F-spec used to disqualify the whole
-        program (live estate: XBRD, the sole writer of a 62-column DDL
-        output, classified program_described_or_complex — zero column
-        lineage). Only files whose own F-spec is program-described are
-        excluded: their records are byte buffers, so name matching would be
-        dishonest for them — but the program's externally described files
-        still participate.
+        The blanket rule "same-named fields between read and written files
+        map column-to-column" fans an output's sources out to every
+        reference file the program binds — unusable for an analyst. The
+        parsed evidence pins it down per output field:
+
+        * **Output field set** — the file's O-specs when present (the
+          definitive list of what the program writes, byte-buffer files
+          included); otherwise the catalog/DSPFFD field set of an
+          externally described file. A program-described file without
+          O-specs stays opaque, as before.
+        * **C-spec assignments** (``parsed_rpg_moves``) — a field assigned
+          by MOVE/Z-ADD/arithmetic derives from the move chain's terminal
+          fields (``cspec_move_chain``, renames included), NOT from a
+          same-named input field; a field assigned only constants derives
+          from nothing (pruned, not guessed).
+        * **Unassigned fields** flow straight through record I/O from the
+          read files that carry them (RPG populates same-named fields of
+          externally described records on READ): ``record_read_through`` /
+          ``ospec_field``. A program-described *read* file contributes its
+          I-spec fields instead of catalog columns.
+
+        Confidence: ``parsed`` when the source field lives in exactly one
+        read file, ``inferred`` (with ``ambiguous_files``) when several
+        read files carry it — the honest residue of static analysis.
         """
-        # Program short-name -> declared names of its PROGRAM-DESCRIBED
-        # F-specs (the byte-buffer files name matching must skip).
         prog_described: dict[str, set[str]] = defaultdict(set)
         rpg_programs: set[str] = set()
         for program, fname, extname, pdesc in self.con.execute(
@@ -933,20 +944,42 @@ class GraphBuilder:
         if not rpg_programs:
             return
 
+        ospec: dict[tuple[str, str], set[str]] = defaultdict(set)
+        for program, fname, fld in self.con.execute(
+                "SELECT program, file, field_name "
+                "FROM parsed_rpg_ospec_fields").fetchall():
+            ospec[(str(program).split("/")[-1].upper(),
+                   str(fname).upper())].add(str(fld).upper())
+        ispec: dict[tuple[str, str], set[str]] = defaultdict(set)
+        for program, fname, fld in self.con.execute(
+                "SELECT program, file, field_name "
+                "FROM parsed_rpg_ispec_fields").fetchall():
+            ispec[(str(program).split("/")[-1].upper(),
+                   str(fname).upper())].add(str(fld).upper())
+        # short program -> result field -> source fields (empty set = only
+        # constant assignments seen: the field is overwritten, sources
+        # unknown).
+        moves: dict[str, dict[str, set[str]]] = defaultdict(dict)
+        for program, src, res in self.con.execute(
+                "SELECT program, source_field, result_field "
+                "FROM parsed_rpg_moves").fetchall():
+            d = moves[str(program).split("/")[-1].upper()] \
+                .setdefault(str(res).upper(), set())
+            if src:
+                d.add(str(src).upper())
+
         ffd = self._dspffd_fields()
 
-        # program -> (reads, writes) file node ids, from edges built so far.
+        # program -> read/write file node ids, from edges built so far
+        # (override-resolved). Program-described files stay in — the O-spec
+        # and I-spec evidence is exactly what makes them transparent.
         reads: dict[str, set[str]] = defaultdict(set)
         writes: dict[str, set[str]] = defaultdict(set)
         for e in self.edges:
             if not e.src.startswith("program:"):
                 continue
             pname = e.src.split(":", 1)[1]
-            short = pname.split("/")[-1].upper()
-            if short not in rpg_programs:
-                continue
-            if e.dst.split(":", 1)[1].split("/")[-1].split("(")[0] \
-                    in prog_described.get(short, ()):
+            if pname.split("/")[-1].upper() not in rpg_programs:
                 continue
             if e.kind == EdgeKind.READS and e.dst.startswith("file:"):
                 reads[pname].add(e.dst)
@@ -961,24 +994,126 @@ class GraphBuilder:
             return (lib, name), ffd.get((lib, name), set())
 
         for pname in set(reads) | set(writes):
-            for w in writes.get(pname, ()):  # written file
-                wkey, wfields = fields_of(w)
-                if not wfields:
+            short = pname.split("/")[-1].upper()
+            pdesc = prog_described.get(short, set())
+            pmoves = moves.get(short, {})
+
+            read_specs: list[tuple[tuple[str, str], set[str]]] = []
+            for r in reads.get(pname, ()):
+                rkey, rfields = fields_of(r)
+                if rkey is None:
                     continue
-                for r in reads.get(pname, ()):  # read file
-                    if r == w:
-                        continue
-                    rkey, rfields = fields_of(r)
-                    common = wfields & rfields
-                    for f in common:
-                        self.add_edge(Edge(
-                            src=self._col_id(wkey[0], wkey[1], f),
-                            dst=self._col_id(rkey[0], rkey[1], f),
-                            kind=EdgeKind.DERIVES_FROM,
-                            provenance=Provenance.SOURCE_RPG,
-                            confidence=Confidence.INFERRED,
-                            context={"program": pname,
-                                     "mechanism": "same_name_field"}))
+                if rkey[1] in pdesc:
+                    # Byte buffer on the read side: only I-spec fields are
+                    # populated — catalog columns of the underlying file
+                    # are NOT program variables here.
+                    rfields = ispec.get((short, rkey[1]), set())
+                else:
+                    rfields = rfields | ispec.get((short, rkey[1]), set())
+                if rfields:
+                    read_specs.append((rkey, rfields))
+
+            for w in writes.get(pname, ()):
+                wkey, wfields = fields_of(w)
+                if wkey is None:
+                    continue
+                ofl = ospec.get((short, wkey[1]))
+                if ofl:
+                    # O-specs are authoritative. Name-match against the
+                    # file's real columns when the catalog knows them; for
+                    # an uncatalogued file the O-spec names ARE the layout.
+                    out_fields = ({f for f in ofl if f in wfields}
+                                  if wfields else set(ofl))
+                    for f in sorted(ofl - out_fields):
+                        self.gap(
+                            "ospec_field_unmapped",
+                            self._col_id(wkey[0], wkey[1], f),
+                            f"O-spec field {f} of {pname} has no same-named "
+                            f"column in {wkey[0]}/{wkey[1]} (position-level "
+                            "mapping not attempted)",
+                            {"program": pname})
+                    mech_direct = "ospec_field"
+                elif wkey[1] in pdesc:
+                    continue  # byte buffer with no O-specs: stays opaque
+                elif wfields:
+                    out_fields = wfields
+                    mech_direct = "record_read_through"
+                else:
+                    continue
+                for f in sorted(out_fields):
+                    self._emit_field_sources(
+                        pname, wkey, f, pmoves, read_specs, mech_direct,
+                        gap_when_untraced=bool(ofl))
+
+    def _emit_field_sources(self, pname: str, wkey: tuple[str, str], f: str,
+                            pmoves: dict[str, set[str]],
+                            read_specs: list[tuple[tuple[str, str], set[str]]],
+                            mech_direct: str,
+                            gap_when_untraced: bool) -> None:
+        """Derives edges for one output field of one written file.
+
+        An assigned field (present in ``pmoves``) resolves through the move
+        chain: walk source fields until one belongs to a read file, carrying
+        the intermediate variables as ``via``. An unassigned field resolves
+        by direct record read-through. Both attribute per terminal field:
+        one owning read file = parsed, several = inferred + ambiguous_files.
+        """
+        collected: list[tuple[str, tuple[str, ...],
+                              list[tuple[str, str]]]] = []
+
+        def owners(tok: str) -> list[tuple[str, str]]:
+            return [rkey for rkey, rfields in read_specs
+                    if tok in rfields and rkey != wkey]
+
+        if f in pmoves:
+            seen = {f}
+            stack: list[tuple[str, tuple[str, ...]]] = [(f, ())]
+            while stack:
+                tok, path = stack.pop()
+                if tok != f:
+                    hits = owners(tok)
+                    if hits:
+                        collected.append((tok, path, hits))
+                        continue  # reached a file-backed field: stop here
+                for s in sorted(pmoves.get(tok, ())):
+                    if s not in seen and len(path) < 8:
+                        seen.add(s)
+                        stack.append((s, path + (tok,)))
+        else:
+            hits = owners(f)
+            if hits:
+                collected.append((f, (), hits))
+
+        if not collected:
+            if gap_when_untraced:
+                self.gap(
+                    "rpg_untraced_output_field",
+                    self._col_id(wkey[0], wkey[1], f),
+                    f"{pname} writes {f} but no source field reaches a read "
+                    "file (constant-fed, or computed from non-file "
+                    "variables)",
+                    {"program": pname})
+            return
+
+        for tok, path, hits in collected:
+            conf = (Confidence.PARSED if len(hits) == 1
+                    else Confidence.INFERRED)
+            ctx_base = {"program": pname,
+                        "mechanism": ("cspec_move_chain" if path
+                                      else mech_direct)}
+            via = path[1:]
+            if via:
+                ctx_base["via"] = " <- ".join(via)
+            if len(hits) > 1:
+                ctx_base["ambiguous_files"] = len(hits)
+            for rkey in hits:
+                self.add_edge(Edge(
+                    src=self._col_id(wkey[0], wkey[1], f),
+                    dst=self._col_id(rkey[0], rkey[1], tok),
+                    kind=EdgeKind.DERIVES_FROM,
+                    provenance=Provenance.SOURCE_RPG,
+                    confidence=conf,
+                    context=dict(ctx_base)))
 
     # -- source coverage -----------------------------------------------------
 

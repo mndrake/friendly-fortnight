@@ -88,6 +88,38 @@ class RpgCopy:
 
 
 @dataclass
+class RpgOField:
+    """One O-spec field entry: the program writes ``field`` to ``file``."""
+    file: str
+    field: str
+    end_pos: Optional[int]
+
+
+@dataclass
+class RpgIField:
+    """One I-spec field entry: reading ``file`` populates ``field``."""
+    file: str
+    field: str
+    ext_name: Optional[str]     # external name when renaming (ext-described)
+    from_pos: Optional[int]
+    to_pos: Optional[int]
+
+
+@dataclass
+class RpgMove:
+    """One data-moving C-spec: ``result`` is assigned from ``source``.
+
+    ``source`` is ``None`` for a constant/literal assignment — recording
+    that the field IS assigned (so the graph build won't claim it flows
+    straight through from an input record) even though no field feeds it.
+    """
+    seq: int
+    opcode: str
+    source: Optional[str]
+    result: str
+
+
+@dataclass
 class RpgProgram:
     program_id: str
     files: list[RpgFile] = field(default_factory=list)
@@ -96,6 +128,9 @@ class RpgProgram:
     sql_blocks: list[str] = field(default_factory=list)
     has_ospecs: bool = False
     has_ispecs: bool = False
+    ospec_fields: list[RpgOField] = field(default_factory=list)
+    ispec_fields: list[RpgIField] = field(default_factory=list)
+    moves: list[RpgMove] = field(default_factory=list)
     # Identifier tokens seen in C-spec factor1/factor2/result and O-spec
     # field-entry areas — candidate "referenced fields" for column usage.
     # Not filtered against a file's real field set here (that intersection
@@ -177,6 +212,124 @@ def _harvest_free_fields(stmt: str, known_files: set[str]) -> set[str]:
     return out
 
 
+# Output-spec special words that are not program fields (page counters and
+# the runtime date family). Figurative constants (*DATE etc.) never match the
+# identifier pattern in the first place.
+_O_SPECIAL = {"PAGE", "PAGE1", "PAGE2", "PAGE3", "PAGE4", "PAGE5", "PAGE6",
+              "PAGE7", "UDATE", "UDAY", "UMONTH", "UYEAR"}
+
+# Data-moving opcodes -> which factors feed the result field. This is the
+# assignment vocabulary of RPG III calculations; opcodes that only set
+# indicators or position files (SETLL, LOKUP, ...) move no data and are
+# deliberately absent. ``MVR`` (remainder of a previous DIV) is recorded
+# against factor-less sources — the result is assigned, provenance unknown.
+_MOVE_SOURCE_FACTORS: dict[str, tuple[int, ...]] = {
+    "MOVE": (2,), "MOVEL": (2,), "MOVEA": (2,),
+    "Z-ADD": (2,), "Z-SUB": (2,), "SQRT": (2,), "XFOOT": (2,),
+    "XLATE": (2,), "SUBST": (2,),
+    "ADD": (1, 2), "SUB": (1, 2), "MULT": (1, 2), "DIV": (1, 2),
+    "CAT": (1, 2),
+    "MVR": (),
+}
+
+
+def _factor_token(area: str) -> Optional[str]:
+    """The field identifier in a factor/result area, or None for literals,
+    figurative constants, and blanks. Array indexes (``ARR,3``) reduce to
+    the array name."""
+    tok = area.strip().split()[0].split(",")[0].upper() if area.strip() else ""
+    return tok if tok and _FIELD_TOKEN_RE.match(tok) else None
+
+
+def _int_or_none(area: str) -> Optional[int]:
+    s = area.strip()
+    return int(s) if s.isdigit() else None
+
+
+def _parse_cspec_move(line: str, seq: int, rpg3: bool) -> list[RpgMove]:
+    """Data-moving C-spec as (source -> result) rows, one per source field.
+
+    A constant-only assignment yields a single ``source=None`` row so the
+    result still counts as "assigned" downstream.
+    """
+    if rpg3:
+        f1a, opa = line[17:27], line[27:32]
+        f2a, resa = line[32:42], line[42:48]
+    else:
+        f1a, opa = line[11:25], line[25:35]
+        f2a, resa = line[35:49], line[49:63]
+    opcode = (opa.strip().upper().split() or [""])[0].split("(")[0]
+    factors = _MOVE_SOURCE_FACTORS.get(opcode)
+    if factors is None:
+        return []
+    result = _factor_token(resa)
+    if result is None:
+        return []
+    sources = [t for t in
+               (_factor_token(f1a) if 1 in factors else None,
+                _factor_token(f2a) if 2 in factors else None) if t]
+    if not sources:
+        return [RpgMove(seq=seq, opcode=opcode, source=None, result=result)]
+    return [RpgMove(seq=seq, opcode=opcode, source=s, result=result)
+            for s in sources]
+
+
+def _ospec_entry(line: str, rpg3: bool, cur_file: Optional[str]
+                 ) -> tuple[Optional[str], Optional[RpgOField]]:
+    """(new current O-file, field entry) for one O-spec line.
+
+    Record identification lines carry the file name (cols 7-14 RPG III /
+    7-16 RPG IV) and set the current file; field description lines have a
+    blank name area and a field name at 32-37 (RPG III) / 30-43 (RPG IV).
+    Constants (blank field area) and output special words (PAGE/UDATE
+    family) are not fields. An EXCPT name sits in the field columns *of a
+    record line*, so it never reaches the field branch.
+    """
+    name = (line[6:14] if rpg3 else line[6:16]).strip().upper() \
+        if len(line) > 6 else ""
+    if name:
+        return name, None
+    if rpg3:
+        fld = line[31:37].strip().upper() if len(line) > 31 else ""
+        end = line[39:43] if len(line) > 39 else ""
+    else:
+        fld = line[29:43].strip().upper() if len(line) > 29 else ""
+        end = line[46:51] if len(line) > 46 else ""
+    if (not cur_file or not fld or fld in _O_SPECIAL
+            or not _FIELD_TOKEN_RE.match(fld)):
+        return cur_file, None
+    return cur_file, RpgOField(file=cur_file, field=fld,
+                               end_pos=_int_or_none(end))
+
+
+def _ispec_entry(line: str, rpg3: bool, cur_file: Optional[str]
+                 ) -> tuple[Optional[str], Optional[RpgIField]]:
+    """(new current I-file, field entry) for one I-spec line.
+
+    Record identification lines name the file in cols 7-14; field
+    description lines have a blank name area and the field name at 53-58
+    (RPG III) / 49-62 (RPG IV), with from/to record positions at 44-47 /
+    48-51 (RPG III). Data-structure subfield lines parse the same way and
+    attribute to the DS name — harmless, since no read file matches it.
+    """
+    name = line[6:14].strip().upper() if len(line) > 6 else ""
+    if name and _FIELD_TOKEN_RE.match(name):
+        return name, None
+    if rpg3:
+        fld = line[52:58].strip().upper() if len(line) > 52 else ""
+        from_pos = _int_or_none(line[43:47]) if len(line) > 43 else None
+        to_pos = _int_or_none(line[47:51]) if len(line) > 47 else None
+    else:
+        fld = line[48:62].strip().upper() if len(line) > 48 else ""
+        from_pos = to_pos = None
+    if not cur_file or not fld or not _FIELD_TOKEN_RE.match(fld):
+        return cur_file, None
+    ext = line[20:30].strip().upper() if len(line) > 20 else ""
+    ext_name = ext if ext and _FIELD_TOKEN_RE.match(ext) else None
+    return cur_file, RpgIField(file=cur_file, field=fld, ext_name=ext_name,
+                               from_pos=from_pos, to_pos=to_pos)
+
+
 def _parse_copy_arg(arg: str) -> RpgCopy:
     """RPG III form: [lib/]srcfile,member — or bare member name."""
     arg = arg.strip().upper()
@@ -197,8 +350,11 @@ def parse(member: SourceMember) -> RpgProgram:
     lines = member.lines
     i = 0
     seq = 0
+    move_seq = 0
     known_files: set[str] = set()
     last_file: Optional[RpgFile] = None
+    cur_ofile: Optional[str] = None
+    cur_ifile: Optional[str] = None
 
     while i < len(lines):
         line = lines[i].rstrip("\n")
@@ -260,6 +416,9 @@ def parse(member: SourceMember) -> RpgProgram:
 
         if ftype == "I":
             prog.has_ispecs = True
+            cur_ifile, ifld = _ispec_entry(line, rpg3, cur_ifile)
+            if ifld is not None:
+                prog.ispec_fields.append(ifld)
             i += 1
             continue
         if ftype == "O":
@@ -269,6 +428,9 @@ def parse(member: SourceMember) -> RpgProgram:
             # field, so record format names etc. are harmless surplus).
             prog.referenced_fields |= _area_tokens(
                 line[31:43] if len(line) > 31 else "", known_files)
+            cur_ofile, ofld = _ospec_entry(line, rpg3, cur_ofile)
+            if ofld is not None:
+                prog.ospec_fields.append(ofld)
             i += 1
             continue
 
@@ -279,6 +441,9 @@ def parse(member: SourceMember) -> RpgProgram:
             if op is not None:
                 seq += 1
                 prog.io_ops.append(op)
+            for mv in _parse_cspec_move(line, move_seq + 1, rpg3=rpg3):
+                move_seq = mv.seq
+                prog.moves.append(mv)
             i += 1
             continue
 
@@ -451,6 +616,7 @@ def parse_all(con) -> dict[str, int]:
     from .base import load_members
 
     file_rows, io_rows, field_ref_rows = [], [], []
+    ospec_rows, ispec_rows, move_rows = [], [], []
     n = 0
     sql_pending: list[tuple[str, str]] = []  # (program_id, sql) for embedded_sql
     for m in load_members(con):
@@ -469,6 +635,14 @@ def parse_all(con) -> dict[str, int]:
             sql_pending.append((prog.program_id, blk))
         for fld in sorted(prog.referenced_fields):
             field_ref_rows.append((prog.program_id, fld))
+        for of in prog.ospec_fields:
+            ospec_rows.append((prog.program_id, of.file, of.field, of.end_pos))
+        for if_ in prog.ispec_fields:
+            ispec_rows.append((prog.program_id, if_.file, if_.field,
+                               if_.ext_name, if_.from_pos, if_.to_pos))
+        for mv in prog.moves:
+            move_rows.append((prog.program_id, mv.seq, mv.opcode, mv.source,
+                              mv.result))
     insert_rows(con, "parsed_rpg_files",
                 ["program", "file", "usage", "extname", "rename_rec",
                  "declared_via", "program_described"], file_rows)
@@ -476,6 +650,14 @@ def parse_all(con) -> dict[str, int]:
                 ["program", "seq", "opcode", "file", "direction"], io_rows)
     insert_rows(con, "parsed_rpg_field_refs",
                 ["program", "field_name"], field_ref_rows)
+    insert_rows(con, "parsed_rpg_ospec_fields",
+                ["program", "file", "field_name", "end_pos"], ospec_rows)
+    insert_rows(con, "parsed_rpg_ispec_fields",
+                ["program", "file", "field_name", "ext_name", "from_pos",
+                 "to_pos"], ispec_rows)
+    insert_rows(con, "parsed_rpg_moves",
+                ["program", "seq", "opcode", "source_field", "result_field"],
+                move_rows)
     # Stash embedded SQL blocks for the SQL parser to consume.
     con.execute("CREATE TEMP TABLE IF NOT EXISTS _rpg_sql_blocks "
                 "(program VARCHAR, seq INTEGER, raw_sql VARCHAR)")
@@ -485,4 +667,7 @@ def parse_all(con) -> dict[str, int]:
                     [pid, idx, blk])
     return {"rpg_programs": n, "rpg_files": len(file_rows),
             "rpg_io_ops": len(io_rows), "rpg_sql_blocks": len(sql_pending),
-            "rpg_field_refs": len(field_ref_rows)}
+            "rpg_field_refs": len(field_ref_rows),
+            "rpg_ospec_fields": len(ospec_rows),
+            "rpg_ispec_fields": len(ispec_rows),
+            "rpg_moves": len(move_rows)}

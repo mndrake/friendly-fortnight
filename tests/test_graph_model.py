@@ -243,3 +243,181 @@ def test_lf_passthrough_defers_to_parsed_dds():
              and u.startswith("column:DTAL/RENLF.")}
     assert "lf_field_passthrough" not in mechs   # parsed DDS won
     con.close()
+
+
+def test_move_chain_resolves_program_described_output():
+    """Fully program-described I/O (byte buffers to DSPFFD) resolves at
+    parsed confidence through O-specs + I-specs + the C-spec move chain:
+    OFLD1 <- MOVEL WFLD1 <- MOVE FLD1 <- READ LEGACY. Catalog columns of a
+    program-described *read* file are not program variables — only the
+    I-spec fields count."""
+    from lineage import db as dbmod
+    from lineage.config import from_dict
+    from lineage.db import insert_rows
+    from lineage.graph.build import build_graph
+
+    con = dbmod.connect(None)
+    cols = []
+    for tbl, names in (("LEGACY", ("FLD1", "FLD2", "EXTRA")),
+                       ("LEGOUT", ("OFLD1", "OFLD2"))):
+        for i, c in enumerate(names):
+            cols.append(("APPX", tbl, tbl, c, c, i + 1, "CHAR", 10, None,
+                         "N", c))
+    insert_rows(con, "raw_syscolumns",
+                ["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal", "data_type", "length",
+                 "numeric_scale", "is_nullable", "column_heading"], cols)
+    insert_rows(con, "raw_dsppgmref",
+                ["program_lib", "program_name", "object_lib", "object_name",
+                 "object_type", "usage_flag", "ref_count"],
+                [("APPX", "PDPGM", "APPX", "LEGACY", "F", "1", 1),
+                 ("APPX", "PDPGM", "APPX", "LEGOUT", "F", "2", 1)])
+    insert_rows(con, "parsed_rpg_files",
+                ["program", "file", "usage", "extname", "rename_rec",
+                 "declared_via", "program_described"],
+                [("APPX/PDPGM", "LEGACY", "input", None, None, "fspec", True),
+                 ("APPX/PDPGM", "LEGOUT", "output", None, None, "fspec", True)])
+    insert_rows(con, "parsed_rpg_ospec_fields",
+                ["program", "file", "field_name", "end_pos"],
+                [("APPX/PDPGM", "LEGOUT", "OFLD1", 6),
+                 ("APPX/PDPGM", "LEGOUT", "OFLD2", 36)])
+    insert_rows(con, "parsed_rpg_ispec_fields",
+                ["program", "file", "field_name", "ext_name", "from_pos",
+                 "to_pos"],
+                [("APPX/PDPGM", "LEGACY", "FLD1", None, 1, 6),
+                 ("APPX/PDPGM", "LEGACY", "FLD2", None, 7, 36)])
+    insert_rows(con, "parsed_rpg_moves",
+                ["program", "seq", "opcode", "source_field", "result_field"],
+                [("APPX/PDPGM", 1, "MOVE", "FLD1", "WFLD1"),
+                 ("APPX/PDPGM", 2, "MOVEL", "WFLD1", "OFLD1"),
+                 ("APPX/PDPGM", 3, "MOVEL", "FLD2", "OFLD2")])
+    config = from_dict({
+        "scratch_lib": "QTEMP", "libraries": ["APPX"],
+        "output_seeds": [{"id": "O", "library": "APPX", "file": "LEGOUT"}],
+        "liblists": {"default": ["APPX"]},
+    })
+    g = build_graph(con, config, phase=3)
+    derives = {(u, v): d for u, v, d in g.edges(data=True)
+               if d.get("kind") == "derives_from"}
+    d1 = derives[("column:APPX/LEGOUT.OFLD1", "column:APPX/LEGACY.FLD1")]
+    assert d1["confidence"] == "parsed"
+    assert d1["context"]["mechanism"] == "cspec_move_chain"
+    assert d1["context"]["via"] == "WFLD1"
+    d2 = derives[("column:APPX/LEGOUT.OFLD2", "column:APPX/LEGACY.FLD2")]
+    assert d2["confidence"] == "parsed"
+    assert "via" not in d2["context"]          # single-hop move, no relay
+    # EXTRA is a catalog column of the byte-buffer read file, not an I-spec
+    # field: it must not appear as a source of anything.
+    assert not any("EXTRA" in v for _, v in derives)
+    con.close()
+
+
+def test_ospec_limits_output_fields_and_prunes_constant_fed():
+    """With O-specs present, only O-spec fields get lineage: a same-named
+    column the program never outputs gets no edge, a constant-fed field is
+    pruned with an explicit gap, and an O-spec field with no matching
+    output column gaps as unmapped."""
+    from lineage import db as dbmod
+    from lineage.config import from_dict
+    from lineage.db import insert_rows
+    from lineage.graph.build import build_graph
+
+    con = dbmod.connect(None)
+    cols = []
+    for tbl in ("OUTF", "INF"):
+        for i, c in enumerate(("F1", "F2", "F3")):
+            cols.append(("APPX", tbl, tbl, c, c, i + 1, "CHAR", 10, None,
+                         "N", c))
+    insert_rows(con, "raw_syscolumns",
+                ["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal", "data_type", "length",
+                 "numeric_scale", "is_nullable", "column_heading"], cols)
+    insert_rows(con, "raw_dsppgmref",
+                ["program_lib", "program_name", "object_lib", "object_name",
+                 "object_type", "usage_flag", "ref_count"],
+                [("APPX", "XPGM", "APPX", "INF", "F", "1", 1),
+                 ("APPX", "XPGM", "APPX", "OUTF", "F", "2", 1)])
+    insert_rows(con, "parsed_rpg_files",
+                ["program", "file", "usage", "extname", "rename_rec",
+                 "declared_via", "program_described"],
+                [("APPX/XPGM", "INF", "input", None, None, "fspec", False),
+                 ("APPX/XPGM", "OUTF", "output", None, None, "fspec", False)])
+    insert_rows(con, "parsed_rpg_ospec_fields",
+                ["program", "file", "field_name", "end_pos"],
+                [("APPX/XPGM", "OUTF", "F1", 10),
+                 ("APPX/XPGM", "OUTF", "F2", 20),
+                 ("APPX/XPGM", "OUTF", "BADFLD", 30)])
+    insert_rows(con, "parsed_rpg_moves",
+                ["program", "seq", "opcode", "source_field", "result_field"],
+                [("APPX/XPGM", 1, "Z-ADD", None, "F2")])   # constant-fed
+    config = from_dict({
+        "scratch_lib": "QTEMP", "libraries": ["APPX"],
+        "output_seeds": [{"id": "O", "library": "APPX", "file": "OUTF"}],
+        "liblists": {"default": ["APPX"]},
+    })
+    g = build_graph(con, config, phase=3)
+    derives = {(u, v): d for u, v, d in g.edges(data=True)
+               if d.get("kind") == "derives_from"}
+    d1 = derives[("column:APPX/OUTF.F1", "column:APPX/INF.F1")]
+    assert d1["confidence"] == "parsed"
+    assert d1["context"]["mechanism"] == "ospec_field"
+    # F2 is assigned a literal: no same-name guess, an explicit gap instead.
+    assert ("column:APPX/OUTF.F2", "column:APPX/INF.F2") not in derives
+    # F3 exists in both files but is not in the O-specs: never written.
+    assert ("column:APPX/OUTF.F3", "column:APPX/INF.F3") not in derives
+    gaps = {(k, o) for k, o in con.execute(
+        "SELECT kind, object_id FROM gaps").fetchall()}
+    assert ("rpg_untraced_output_field", "column:APPX/OUTF.F2") in gaps
+    assert ("ospec_field_unmapped", "column:APPX/OUTF.BADFLD") in gaps
+    con.close()
+
+
+def test_unique_read_through_promoted_ambiguous_stays_inferred():
+    """Without O-specs (externally described write), an unassigned output
+    field in exactly one read file is definitive (parsed); one present in
+    several read files stays inferred, marked with the ambiguity count."""
+    from lineage import db as dbmod
+    from lineage.config import from_dict
+    from lineage.db import insert_rows
+    from lineage.graph.build import build_graph
+
+    con = dbmod.connect(None)
+    cols = []
+    for tbl, names in (("OUTF", ("SOLO", "BOTH")),
+                       ("INA", ("SOLO", "BOTH")), ("INB", ("BOTH",))):
+        for i, c in enumerate(names):
+            cols.append(("APPX", tbl, tbl, c, c, i + 1, "CHAR", 10, None,
+                         "N", c))
+    insert_rows(con, "raw_syscolumns",
+                ["table_schema", "table_name", "system_name", "column_name",
+                 "system_column", "ordinal", "data_type", "length",
+                 "numeric_scale", "is_nullable", "column_heading"], cols)
+    insert_rows(con, "raw_dsppgmref",
+                ["program_lib", "program_name", "object_lib", "object_name",
+                 "object_type", "usage_flag", "ref_count"],
+                [("APPX", "RPGM", "APPX", "INA", "F", "1", 1),
+                 ("APPX", "RPGM", "APPX", "INB", "F", "1", 1),
+                 ("APPX", "RPGM", "APPX", "OUTF", "F", "2", 1)])
+    insert_rows(con, "parsed_rpg_files",
+                ["program", "file", "usage", "extname", "rename_rec",
+                 "declared_via", "program_described"],
+                [("APPX/RPGM", "INA", "input", None, None, "fspec", False),
+                 ("APPX/RPGM", "INB", "input", None, None, "fspec", False),
+                 ("APPX/RPGM", "OUTF", "output", None, None, "fspec", False)])
+    config = from_dict({
+        "scratch_lib": "QTEMP", "libraries": ["APPX"],
+        "output_seeds": [{"id": "O", "library": "APPX", "file": "OUTF"}],
+        "liblists": {"default": ["APPX"]},
+    })
+    g = build_graph(con, config, phase=3)
+    derives = {(u, v): d for u, v, d in g.edges(data=True)
+               if d.get("kind") == "derives_from"}
+    solo = derives[("column:APPX/OUTF.SOLO", "column:APPX/INA.SOLO")]
+    assert solo["confidence"] == "parsed"
+    assert solo["context"]["mechanism"] == "record_read_through"
+    both_a = derives[("column:APPX/OUTF.BOTH", "column:APPX/INA.BOTH")]
+    both_b = derives[("column:APPX/OUTF.BOTH", "column:APPX/INB.BOTH")]
+    for d in (both_a, both_b):
+        assert d["confidence"] == "inferred"
+        assert d["context"]["ambiguous_files"] == 2
+    con.close()

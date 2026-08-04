@@ -25,7 +25,9 @@ LAYER_TABLES: dict[str, tuple[str, ...]] = {
     "parsed": (
         "parsed_cl_statements", "parsed_cl_overrides", "parsed_cl_calls",
         "parsed_dds_files", "parsed_dds_fields", "parsed_rpg_files",
-        "parsed_rpg_io_ops", "parsed_rpg_field_refs", "parsed_sql_statements",
+        "parsed_rpg_io_ops", "parsed_rpg_field_refs",
+        "parsed_rpg_ospec_fields", "parsed_rpg_ispec_fields",
+        "parsed_rpg_moves", "parsed_sql_statements",
         "program_classification",
     ),
     "graph": ("nodes", "edges"),

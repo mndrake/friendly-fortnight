@@ -3,7 +3,7 @@
      FLEGOUT  O   F     132          DISK
      I*  PROGRAM-DESCRIBED INPUT LAYOUT
      ILEGACY  AA  01
-     I                                        1  60FLD1
+     I                                        1   60FLD1
      I                                        7  36 FLD2
      C                     READ LEGACY                   90
      C                     MOVE FLD1      WFLD1

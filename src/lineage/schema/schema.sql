@@ -187,6 +187,40 @@ CREATE TABLE IF NOT EXISTS parsed_rpg_io_ops (
     direction      VARCHAR    -- read / write
 );
 
+CREATE TABLE IF NOT EXISTS parsed_rpg_ospec_fields (
+    -- O-spec field entries: the definitive list of fields a program writes
+    -- to each output file (record-format/EXCPT names and constants excluded
+    -- at parse time). Drives exact output-column mapping in the graph build.
+    program        VARCHAR,
+    file           VARCHAR,   -- output file as declared on the O record line
+    field_name     VARCHAR,
+    end_pos        INTEGER    -- output record end position (cols 40-43)
+);
+
+CREATE TABLE IF NOT EXISTS parsed_rpg_ispec_fields (
+    -- I-spec field entries: fields populated by reading each input file.
+    -- Gives program-described input files (byte buffers to DSPFFD) a real
+    -- field set, and captures external-name renames.
+    program        VARCHAR,
+    file           VARCHAR,
+    field_name     VARCHAR,
+    ext_name       VARCHAR,   -- external field name when renamed
+    from_pos       INTEGER,
+    to_pos         INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS parsed_rpg_moves (
+    -- Data-moving C-specs flattened to (source -> result) pairs.
+    -- source_field NULL = assigned from a literal/constant: the field is
+    -- provably overwritten, so it must NOT be treated as flowing straight
+    -- through from an input record.
+    program        VARCHAR,
+    seq            INTEGER,
+    opcode         VARCHAR,   -- MOVE/MOVEL/Z-ADD/ADD/...
+    source_field   VARCHAR,
+    result_field   VARCHAR
+);
+
 CREATE TABLE IF NOT EXISTS parsed_rpg_field_refs (
     -- Identifier tokens harvested from C-spec factor1/factor2/result areas
     -- and O-spec field-entry areas — pure token harvesting, no opcode
